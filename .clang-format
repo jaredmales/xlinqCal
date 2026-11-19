@@ -1,0 +1,27 @@
+Language:        Cpp
+IndentWidth:     4
+BreakBeforeBraces: Allman
+InsertBraces:    true
+AlwaysBreakTemplateDeclarations: Yes
+SpaceBeforeParens: false
+AlignAfterOpenBracket: Align
+ColumnLimit:     120
+SpacesInConditionalStatement: true
+SpacesInCStyleCastParentheses: false
+SpacesInParentheses: true
+AllowShortFunctionsOnASingleLine: false
+AllowShortLambdasOnASingleLine: None
+AlignTrailingComments: true
+BinPackArguments: false
+BinPackParameters: false
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+
+#This will screw with forwards for template instantiation if true
+SortIncludes: false
+
+IndentPPDirectives: BeforeHash
+ContinuationIndentWidth: 4
+
+# Preserve the required "{ //mutex scope" lifetime annotations.
+SpacesInLineCommentPrefix: {Minimum: 0, Maximum: -1}
