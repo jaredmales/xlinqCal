@@ -217,6 +217,8 @@ xlinqCal/
   - Integration tests run xlinqCal in-process against the simulator. They check recovered responses against `amp*R*shape` (<5%), timing-table consistency, DM restore, FITS output, and a mid-run stop (exit code 1, completed planes written, nonzero initial channel restored, `POKE0`/`NPOKE`/`COMPLETE` headers).
 - Not implemented from the original plan: `wfs.cpuset` (run the program inside a cpuset instead, see README); the timestamp-matching mode (dropped per 5.2 #6).
 
+- 2026-11-19: removed the 1 µm rms check on poke shapes. The rms is defined over the DM's active actuator mask, so a full-frame rms check would warn on correctly normalized cubes. Supplying a correctly normalized cube is the operator's responsibility.
+
 ### 5.8 Follow-ups and edge cases
 - **Memory/output size with full-frame camsci1:** all response planes are held in memory, and checkpoints rewrite the full cubes. For a 1024x1024 camsci1 and 2040 pokes, that is about 8.5 GB per cube. The preflight prints the size. If this is too large, use a camsci1 ROI, or change xlinqCal to append planes to the FITS file as it goes.
 - **Torn camwfs frames:** the `cnt0` check catches a frame replaced after the post. It cannot catch an in-place writer that is midway through copying the *next* frame before incrementing `cnt0`. Reads happen immediately after each post, so this needs the reader to fall about one frame period behind. The counts of missed and torn frames are in the timing table.

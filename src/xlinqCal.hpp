@@ -96,7 +96,7 @@ class xlinqCal : public mx::app::application
 
     double m_dmProjTol{ 0.25 }; ///< Warn if the combined DM projection differs from 1 by more than this.
 
-    std::string m_pokeFile; ///< FITS cube of DM shapes, rows x cols x Npoke, normalized to 1 micron rms.
+    std::string m_pokeFile; ///< FITS cube of DM shapes, rows x cols x Npoke, 1 micron rms (operator-supplied).
 
     float m_pokeAmp{ 0 }; ///< The poke amplitude, microns rms. Required, must be nonzero.
 
@@ -488,7 +488,8 @@ inline void xlinqCal::setupConfig()
                 "file",
                 false,
                 "string",
-                "FITS cube of DM shapes (rows x cols x Npoke), each normalized to 1 micron rms. Required." );
+                "FITS cube of DM shapes (rows x cols x Npoke), each normalized to 1 micron rms over the active "
+                "actuators. Normalization is not checked. Required." );
     config.add( "poke.amp",
                 "",
                 "poke.amp",
@@ -775,25 +776,6 @@ inline int xlinqCal::loadPokes()
         logError( "invalid poke range " + std::to_string( m_pokeFirst ) + "-" + std::to_string( m_pokeLast ) + " for " +
                   std::to_string( m_pokes.planes() ) + " pokes" );
         return -1;
-    }
-
-    // Report shapes that are not normalized as expected, but don't refuse.
-    for( int k = m_pokeFirst; k <= m_pokeLast; ++k )
-    {
-        auto   shape = m_pokes.image( k );
-        double ms    = shape.square().sum() / shape.size();
-
-        if( ms <= 0 )
-        {
-            logError( "poke " + std::to_string( k ) + " is all zeros" );
-            return -1;
-        }
-
-        double rms = sqrt( ms );
-        if( fabs( rms - 1 ) > 0.01 )
-        {
-            log( "warning: poke " + std::to_string( k ) + " has rms " + std::to_string( rms ) + ", expected 1" );
-        }
     }
 
     return 0;

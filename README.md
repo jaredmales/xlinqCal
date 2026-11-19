@@ -16,7 +16,7 @@ The response for each camera is `(mean(+) - mean(-))/2`, averaged over repeats. 
 
 - Loop open, system aligned, cameras running at their intended settings. Don't change camera modes or ROIs during a run.
 - camsci1 must appear on RTC. On RTC run `shmimTCPreceive <port>`, then on ICC run `shmimTCPtransmit camsci1 <RTC address> <port>` (see the handbook's shmimTCP page).
-- A poke cube: FITS, 50x50xNpoke, in microns, each shape normalized to 1 µm rms.
+- A poke cube: FITS, 50x50xNpoke, in microns, each shape normalized to 1 µm rms over the active actuator mask. xlinqCal does not check the normalization.
 
 ## Running
 
