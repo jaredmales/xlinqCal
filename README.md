@@ -14,6 +14,8 @@ For each poke shape `k` and each sign in the sequence (`+-`, then `-+`, ... for 
 - `aol1_imWFS2pub`: dark-subtracted, flux-normalized, masked, reference-subtracted frames.
 - `aol1_modevalWFSpub`: the loop's per-frame modal coefficients.
 
+`snap.shmim` lists streams to save as part of the calibration record, e.g. `aol1_wfsref,aol1_wfsmask`. Each must exist at startup.
+
 Use these rather than `aol1_imWFS2`/`aol1_modevalWFS` themselves, to avoid stealing cache lines from the loop. Raw `camwfs` (the default) also works. The cacao WFS acquisition and modal extraction must be running with the loop open, and the preflight fails if a stream isn't updating. The modal coefficients are the same coordinates that `aol1_modevalWFS-sw` records, so a model calibrated on them can be applied directly to recorded science sequences.
 
 The response for each camera is `(mean(+) - mean(-))/2`, averaged over repeats. It is **not** divided by the amplitude. The symmetric mean `(mean(+) + mean(-))/2` is saved too, so both sign means can be recovered. If the sign doesn't change between consecutive acquisitions (the middle `--`), the DM is not rewritten and no frames are discarded.
@@ -48,6 +50,8 @@ In `out.dir`, with prefix `out.prefix` (default `xlinqCal_<UTC>`):
 | `<prefix>_<cam>_even.fits` | even part `mean − ref` (ref interpolated in time), one plane per poke. `EVEN1SID` counts planes that used only the nearest reference (e.g. after a stop) |
 | `<prefix>_<cam>_ref.fits` | zero-poke reference frames, in acquisition order |
 | `<prefix>_timing.fits` | one row per acquisition: poke, repeat, sign (0 = reference, with the reference index in REPEAT), DM cnt0 and projection, camsci1 cnt0 range and frame counts, gate times, then for each WFS stream `j` its cnt0 range, frame count, and missed and torn frames (`WjCNT0A`, `WjCNT0B`, `WjN`, `WjMISS`, `WjTORN`). Column names are in `TCOLn` |
+| `<prefix>_snap_<name>.fits` | content of each `snap.shmim` stream (e.g. `aol1_wfsref`, `aol1_wfsmask`) just before the first poke, saved as float; header has the stream's cnt0 and write time |
+| `<prefix>_snap_<name>_end.fits` | written only if that stream changed during the run (a warning is logged) |
 | `<prefix>.log` | run log |
 
 `<cam>` is the stream name (`camsci1`, and each WFS stream). Headers record the configuration, stream names, datatypes, measured fps, poke range (`POKE0`, `NPOKE`), references (`REFEVERY`, `NREF`), `PRODUCT`, `COMPLETE`, and start/end times. Partial results are checkpointed every `out.checkpointMin` minutes.

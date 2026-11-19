@@ -183,6 +183,20 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
     mx::fits::fitsFile<float>    ff;
     REQUIRE( ff.write( pokeFile, pokes ) == mx::error_t::noerror );
 
+    // Snapshot streams, standing in for aol1_wfsref and aol1_wfsmask
+    std::string snapRef  = cfg.prefix + "wfsref";
+    std::string snapMask = cfg.prefix + "wfsmask";
+
+    simStream wfsref, wfsmask;
+    wfsref.create( snapRef, _DATATYPE_FLOAT, 16, 16 );
+    wfsmask.create( snapMask, _DATATYPE_FLOAT, 16, 16 );
+
+    for( int i = 0; i < 256; ++i )
+    {
+        wfsref.data<float>()[i]  = 0.001f * i;
+        wfsmask.data<float>()[i] = ( i % 3 == 0 ) ? 1.0f : 0.0f;
+    }
+
     xlinqSim sim( cfg );
     sim.start();
 
@@ -197,6 +211,7 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
                                       "--preflight.time=0.5",
                                       "--out.dir=" + dir.string(),
                                       "--out.prefix=test",
+                                      "--snap.shmim=" + snapRef + "," + snapMask,
                                       "--yes" };
 
     std::vector<char *> argv;
@@ -315,6 +330,16 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
     REQUIRE( std::filesystem::exists( dir / ( "test_" + cfg.wfsName + "_resp.fits" ) ) );
     REQUIRE( std::filesystem::exists( dir / "test_timing.fits" ) );
 
+    // Snapshots match the streams, and are unchanged so no _end files
+    mx::improc::eigenImage<float> snapIm;
+    REQUIRE( ff.read( snapIm, ( dir / ( "test_snap_" + snapRef + ".fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( snapIm.rows() == 16 );
+    REQUIRE( snapIm( 5, 1 ) == Approx( 0.001f * ( 5 + 16 ) ) );
+    REQUIRE( ff.read( snapIm, ( dir / ( "test_snap_" + snapMask + ".fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( snapIm.sum() == 86 );
+    REQUIRE_FALSE( std::filesystem::exists( dir / ( "test_snap_" + snapRef + "_end.fits" ) ) );
+    REQUIRE_FALSE( std::filesystem::exists( dir / ( "test_snap_" + snapMask + "_end.fits" ) ) );
+
     mx::improc::eigenCube<float> sciFile;
     REQUIRE( ff.read( sciFile, ( dir / ( "test_" + cfg.sciName + "_resp.fits" ) ).string() ) == mx::error_t::noerror );
     REQUIRE( sciFile.planes() == nPoke );
@@ -352,6 +377,11 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
     mx::fits::fitsFile<float> ff;
     REQUIRE( ff.write( pokeFile, xlinqSim::randomPokes( cfg.dmRows, cfg.dmCols, 20, 3 ) ) == mx::error_t::noerror );
 
+    // A snapshot stream that changes during the run
+    std::string snapRef = cfg.prefix + "wfsref";
+    simStream   wfsref;
+    wfsref.create( snapRef, _DATATYPE_FLOAT, 8, 8 );
+
     xlinqSim sim( cfg );
     sim.start();
 
@@ -373,6 +403,7 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
                                       "--preflight.time=0.3",
                                       "--out.dir=" + dir.string(),
                                       "--out.prefix=stop",
+                                      "--snap.shmim=" + snapRef,
                                       "--yes" };
 
     std::vector<char *> argv;
@@ -383,9 +414,12 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
 
     xlinqCal::xlinqCal app;
     std::thread        stopper(
-        []()
+        [&wfsref]()
         {
-            std::this_thread::sleep_for( std::chrono::milliseconds( 2000 ) );
+            std::this_thread::sleep_for( std::chrono::milliseconds( 1000 ) );
+            wfsref.data<float>()[3] = 7;
+            wfsref.post();
+            std::this_thread::sleep_for( std::chrono::milliseconds( 1000 ) );
             xlinqCal::xlinqCal::requestStop();
         } );
 
@@ -411,6 +445,13 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
     REQUIRE( ff.read( evenFile, ( dir / ( "stop_" + cfg.wfsName + "_even.fits" ) ).string() ) == mx::error_t::noerror );
     REQUIRE( evenFile.planes() == app.nDone() );
     REQUIRE( app.nRef() >= app.nDone() );
+
+    // The changed snapshot stream is saved at the start (zeros) and at the end
+    mx::improc::eigenImage<float> snapIm;
+    REQUIRE( ff.read( snapIm, ( dir / ( "stop_snap_" + snapRef + ".fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( snapIm.abs().maxCoeff() == 0 );
+    REQUIRE( ff.read( snapIm, ( dir / ( "stop_snap_" + snapRef + "_end.fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( snapIm( 3, 0 ) == 7 );
 
     dm.close();
     sim.stop();

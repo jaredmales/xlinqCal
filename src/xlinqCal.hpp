@@ -46,7 +46,8 @@
  * `ref.every` pokes, and the even part `mean - ref` is formed with the reference linearly
  * interpolated to each poke's center time, which cancels linear drift. Several WFS streams can be
  * gated together (`wfs.shmim`), e.g. calibrated frames `aol1_imWFS2pub` and the loop's modal
- * coefficients `aol1_modevalWFSpub`.
+ * coefficients `aol1_modevalWFSpub`. Streams listed in `snap.shmim` (e.g. `aol1_wfsref`,
+ * `aol1_wfsmask`) are saved at the start, and again at the end if they changed.
  */
 
 /** \defgroup xlinqCal_files xlinqCal Files
@@ -137,6 +138,8 @@ class xlinqCal : public mx::app::application
 
     std::vector<std::string> m_wfsNames{ "camwfs" }; ///< The WFS streams, averaged over the camsci1 windows.
 
+    std::vector<std::string> m_snapNames; ///< Streams saved at the start (and end, if changed), e.g. aol1_wfsref.
+
     unsigned m_nRepeat{ 2 }; ///< Number of +/- pairs per poke, with alternating order.
 
     unsigned m_refEvery{ 1 }; ///< Pokes between zero-poke reference acquisitions, 0 disables references.
@@ -160,6 +163,10 @@ class xlinqCal : public mx::app::application
     isioStream m_sci; ///< The camsci1 stream, with claimed semaphore.
 
     std::vector<std::unique_ptr<wfsChannel>> m_wfs; ///< The WFS streams, each with its own reader thread.
+
+    std::vector<std::unique_ptr<isioStream>> m_snap; ///< The snapshot streams, opened without semaphores.
+
+    std::vector<mx::improc::eigenImage<float>> m_snapStart; ///< Snapshot content at the start of measurement.
 
     isioStream m_comb; ///< The combined DM stream, with claimed semaphore.
 
@@ -369,6 +376,28 @@ class xlinqCal : public mx::app::application
                  mx::improc::eigenImage<double>              &sciMean,  /**< [out] the camsci1 mean */
                  std::vector<mx::improc::eigenImage<double>> &wfsMeans, /**< [out] the WFS means */
                  timingRecord                                &rec /**< [in.out] camera fields are set */ );
+
+    /// Copy the current content of each snapshot stream.
+    /** \returns 0 on success, -1 on error
+     */
+    int readSnapshots( std::vector<mx::improc::eigenImage<float>> &ims /**< [out] one image per stream */ );
+
+    /// Write one snapshot to `<prefix>_snap_<name><suffix>.fits`.
+    /** \returns 0 on success, -1 on error
+     */
+    int writeSnapshot( size_t                               j,  /**< [in] the snapshot stream index */
+                       const mx::improc::eigenImage<float> &im, /**< [in] the content */
+                       const std::string                   &suffix /**< [in] e.g. "" or "_end" */ );
+
+    /// Save the start snapshots.
+    /** \returns 0 on success, -1 on error
+     */
+    int saveStartSnapshots();
+
+    /// Compare the end state of the snapshot streams with the start, and save any that changed.
+    /** \returns 0 on success (changed or not), -1 on error
+     */
+    int checkEndSnapshots();
 
     /// Restore the DM channel to its initial content.
     void restoreDm();
@@ -648,6 +677,17 @@ inline void xlinqCal::setupConfig()
                 "vector<string>",
                 "The WFS streams, comma separated, e.g. aol1_imWFS2pub,aol1_modevalWFSpub. Default camwfs." );
 
+    config.add( "snap.shmim",
+                "",
+                "snap.shmim",
+                argType::Required,
+                "snap",
+                "shmim",
+                false,
+                "vector<string>",
+                "Streams to save at the start (and end, if changed), comma separated, e.g. "
+                "aol1_wfsref,aol1_wfsmask. Default none." );
+
     config.add( "seq.nRepeat",
                 "",
                 "seq.nRepeat",
@@ -728,6 +768,7 @@ inline void xlinqCal::loadConfig()
     config( m_sciWait, "sci.wait" );
 
     config( m_wfsNames, "wfs.shmim" );
+    config( m_snapNames, "snap.shmim" );
 
     config( m_nRepeat, "seq.nRepeat" );
 
@@ -770,7 +811,7 @@ inline int xlinqCal::execute()
         return rv;
     }
 
-    if( setupOutput() < 0 )
+    if( setupOutput() < 0 || saveStartSnapshots() < 0 )
     {
         return -1;
     }
@@ -792,6 +833,11 @@ inline int xlinqCal::execute()
 
     restoreDm();
     stopWfsThread();
+
+    if( checkEndSnapshots() < 0 )
+    {
+        rv = -1;
+    }
 
     clock_gettime( CLOCK_REALTIME, &ts );
     m_dateEnd = isoTime( ts );
@@ -921,6 +967,13 @@ inline int xlinqCal::openStreams()
         {
             m_wfs.push_back( std::make_unique<wfsChannel>() );
             m_wfs.back()->open( name );
+        }
+
+        m_snap.clear();
+        for( const std::string &name : m_snapNames )
+        {
+            m_snap.push_back( std::make_unique<isioStream>() );
+            m_snap.back()->open( name, false );
         }
     }
     catch( const std::exception &e )
@@ -1468,6 +1521,103 @@ inline int xlinqCal::acquire( bool                                         settl
     return 0;
 }
 
+inline int xlinqCal::readSnapshots( std::vector<mx::improc::eigenImage<float>> &ims )
+{
+    ims.resize( m_snap.size() );
+
+    for( size_t j = 0; j < m_snap.size(); ++j )
+    {
+        uint64_t cnt0;
+        int      tries = 0;
+
+        while( !m_snap[j]->copy( ims[j], cnt0 ) )
+        {
+            if( ++tries > 100 )
+            {
+                logError( "snapshot of " + m_snapNames[j] + " kept changing during the copy" );
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+inline int xlinqCal::writeSnapshot( size_t j, const mx::improc::eigenImage<float> &im, const std::string &suffix )
+{
+    timespec ts;
+    clock_gettime( CLOCK_REALTIME, &ts );
+
+    timespec wt = m_snap[j]->writetime();
+
+    mx::fits::fitsHeader<> head;
+    head.append( "XLQVERS", std::string( XLINQCAL_GIT_VERSION ), "xlinqCal version" );
+    head.append( "SNAPSTRM", m_snapNames[j], "snapshot stream" );
+    head.append( "SNAPCNT0", (long)m_snap[j]->cnt0(), "stream cnt0 at snapshot" );
+    head.append( "SNAPWRT", isoTime( wt ), "stream write time, UTC" );
+    head.append( "DATE-OBS", isoTime( ts ), "snapshot time, UTC" );
+    head.append( "SNAPTYPE", (int)m_snap[j]->datatype(), "stream ImageStreamIO datatype (saved as float)" );
+
+    std::string               file = outputPath( "_snap_" + m_snapNames[j] + suffix + ".fits" );
+    mx::fits::fitsFile<float> ff;
+
+    if( ff.write( file, im, head ) != mx::error_t::noerror )
+    {
+        logError( "could not write " + file );
+        return -1;
+    }
+
+    return 0;
+}
+
+inline int xlinqCal::saveStartSnapshots()
+{
+    if( readSnapshots( m_snapStart ) < 0 )
+    {
+        return -1;
+    }
+
+    for( size_t j = 0; j < m_snap.size(); ++j )
+    {
+        if( writeSnapshot( j, m_snapStart[j], "" ) < 0 )
+        {
+            return -1;
+        }
+
+        log( "saved snapshot of " + m_snapNames[j] );
+    }
+
+    return 0;
+}
+
+inline int xlinqCal::checkEndSnapshots()
+{
+    std::vector<mx::improc::eigenImage<float>> end;
+
+    if( readSnapshots( end ) < 0 )
+    {
+        return -1;
+    }
+
+    for( size_t j = 0; j < m_snap.size(); ++j )
+    {
+        bool same = end[j].rows() == m_snapStart[j].rows() && end[j].cols() == m_snapStart[j].cols() &&
+                    ( end[j] == m_snapStart[j] ).all();
+
+        if( !same )
+        {
+            log( "warning: " + m_snapNames[j] + " changed during the run; end state saved with suffix _end" );
+
+            if( writeSnapshot( j, end[j], "_end" ) < 0 )
+            {
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 inline void xlinqCal::restoreDm()
 {
     if( !m_dmWritten )
@@ -1509,6 +1659,13 @@ inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
     head.append( "SCISTRM", m_sciName, "science camera stream" );
     head.append( "SCIFPS", m_sciFps, "measured sci frame rate [Hz]" );
     head.append( "SCITYPE", (int)m_sci.datatype(), "sci ImageStreamIO datatype" );
+    head.append( "NSNAP", (int)m_snapNames.size(), "number of snapshot streams" );
+
+    for( size_t j = 0; j < m_snapNames.size(); ++j )
+    {
+        head.append( "SNAP" + std::to_string( j ), m_snapNames[j], "snapshot stream, see _snap_ files" );
+    }
+
     head.append( "NWFS", (int)m_wfs.size(), "number of WFS streams" );
 
     for( size_t j = 0; j < m_wfs.size(); ++j )
