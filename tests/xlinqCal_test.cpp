@@ -43,6 +43,17 @@ TEST_CASE( "settleCount counts DM changes", "[xlinqCal]" )
     REQUIRE( xlinqCal::settleCount( xlinqCal::signSequence( 3 ) ) == 4 );
 }
 
+/// Doubled names, the signature of a repeated config key joined by mxlib, are detected.
+TEST_CASE( "looksDoubled detects repeated-key stream names", "[xlinqCal]" )
+{
+    using xlinqCal::xlinqCal;
+
+    REQUIRE( xlinqCal::looksDoubled( "aol1_imWFS2pubaol1_imWFS2pub" ) );
+    REQUIRE_FALSE( xlinqCal::looksDoubled( "aol1_imWFS2pub" ) );
+    REQUIRE_FALSE( xlinqCal::looksDoubled( "camsci1" ) );
+    REQUIRE_FALSE( xlinqCal::looksDoubled( "" ) );
+}
+
 /// Reference interpolation brackets a time when possible and falls back to the nearest reference.
 TEST_CASE( "refWeights interpolates between bracketing references", "[xlinqCal]" )
 {
@@ -181,7 +192,9 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
     mx::improc::eigenCube<float> pokes    = xlinqSim::randomPokes( cfg.dmRows, cfg.dmCols, nPoke, 7 );
     std::string                  pokeFile = ( dir / "pokes.fits" ).string();
     mx::fits::fitsFile<float>    ff;
-    REQUIRE( ff.write( pokeFile, pokes ) == mx::error_t::noerror );
+    mx::fits::fitsHeader<>       pokeHead;
+    pokeHead.append( "TESTCARD", 42, "should be copied to _pokes.fits" );
+    REQUIRE( ff.write( pokeFile, pokes, pokeHead ) == mx::error_t::noerror );
 
     // Snapshot streams, standing in for aol1_wfsref and aol1_wfsmask
     std::string snapRef  = cfg.prefix + "wfsref";
@@ -329,6 +342,15 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
     REQUIRE( std::filesystem::exists( dir / ( "test_" + cfg.sciName + "_resp.fits" ) ) );
     REQUIRE( std::filesystem::exists( dir / ( "test_" + cfg.wfsName + "_resp.fits" ) ) );
     REQUIRE( std::filesystem::exists( dir / "test_timing.fits" ) );
+
+    // Applied pokes are saved with the poke file's header
+    mx::improc::eigenCube<float> applied;
+    mx::fits::fitsHeader<>       appliedHead;
+    REQUIRE( ff.read( applied, appliedHead, ( dir / "test_pokes.fits" ).string() ) == mx::error_t::noerror );
+    REQUIRE( applied.planes() == nPoke );
+    REQUIRE( ( applied.image( 2 ) - amp * pokes.image( 2 ) ).abs().maxCoeff() < 1e-6 );
+    REQUIRE( appliedHead["TESTCARD"].value<int>() == 42 );
+    REQUIRE( appliedHead["POKEAMP"].value<float>() == Approx( amp ) );
 
     // Snapshots match the streams, and are unchanged so no _end files
     mx::improc::eigenImage<float> snapIm;

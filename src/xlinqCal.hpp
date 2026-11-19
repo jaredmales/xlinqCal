@@ -180,6 +180,8 @@ class xlinqCal : public mx::app::application
 
     mx::improc::eigenCube<float> m_pokes; ///< The poke shapes, normalized to 1 micron rms.
 
+    mx::fits::fitsHeader<> m_pokeHead; ///< The poke file's header, without its standard top, copied into _pokes.fits.
+
     camProducts m_sciProd; ///< The camsci1 per-poke products (the WFS products are in each wfsChannel).
 
     std::vector<double> m_pokeTime; ///< Center time of each completed poke, Unix seconds.
@@ -223,6 +225,12 @@ class xlinqCal : public mx::app::application
 
     /// Count the acquisitions in a sign sequence that follow a DM change and so need settling.
     static unsigned settleCount( const std::vector<int> &signs /**< [in] the sign sequence */ );
+
+    /// Check whether a name is a string repeated twice, e.g. "abcabc".
+    /** mxlib's ini parser joins the values of a key repeated within a section with no separator,
+     * so a doubled stream name usually means a repeated key in the config file.
+     */
+    static bool looksDoubled( const std::string &name /**< [in] the name to check */ );
 
     /// Format a timestamp as UTC ISO 8601 with milliseconds.
     static std::string isoTime( const timespec &ts /**< [in] the time to format */ );
@@ -389,6 +397,13 @@ class xlinqCal : public mx::app::application
                        const mx::improc::eigenImage<float> &im, /**< [in] the content */
                        const std::string                   &suffix /**< [in] e.g. "" or "_end" */ );
 
+    /// Save the applied pokes, `poke.amp` times the requested planes, with the poke file's header.
+    /** Written to `<prefix>_pokes.fits` before the first poke.
+     *
+     * \returns 0 on success, -1 on error
+     */
+    int savePokes();
+
     /// Save the start snapshots.
     /** \returns 0 on success, -1 on error
      */
@@ -459,6 +474,13 @@ inline unsigned xlinqCal::settleCount( const std::vector<int> &signs )
     }
 
     return n;
+}
+
+inline bool xlinqCal::looksDoubled( const std::string &name )
+{
+    size_t h = name.size() / 2;
+
+    return h > 0 && name.size() % 2 == 0 && name.compare( 0, h, name, h, h ) == 0;
 }
 
 inline std::string xlinqCal::isoTime( const timespec &ts )
@@ -811,7 +833,7 @@ inline int xlinqCal::execute()
         return rv;
     }
 
-    if( setupOutput() < 0 || saveStartSnapshots() < 0 )
+    if( setupOutput() < 0 || savePokes() < 0 || saveStartSnapshots() < 0 )
     {
         return -1;
     }
@@ -902,7 +924,7 @@ inline int xlinqCal::loadPokes()
     }
 
     mx::fits::fitsFile<float> ff;
-    if( ff.read( m_pokes, m_pokeFile ) != mx::error_t::noerror )
+    if( ff.read( m_pokes, m_pokeHead, m_pokeFile ) != mx::error_t::noerror )
     {
         logError( "could not read poke file " + m_pokeFile );
         return -1;
@@ -925,6 +947,20 @@ inline int xlinqCal::loadPokes()
 
 inline int xlinqCal::openStreams()
 {
+    std::vector<std::string> names = { m_dmChannel, m_dmComb, m_sciName };
+    names.insert( names.end(), m_wfsNames.begin(), m_wfsNames.end() );
+    names.insert( names.end(), m_snapNames.begin(), m_snapNames.end() );
+
+    for( const std::string &n : names )
+    {
+        if( looksDoubled( n ) )
+        {
+            logError( "stream name " + n +
+                      " looks doubled: is the key repeated in the config file? (repeated keys are joined)" );
+            return -1;
+        }
+    }
+
     try
     {
         m_dm.open( m_dmChannel );
@@ -1562,6 +1598,38 @@ inline int xlinqCal::writeSnapshot( size_t j, const mx::improc::eigenImage<float
     mx::fits::fitsFile<float> ff;
 
     if( ff.write( file, im, head ) != mx::error_t::noerror )
+    {
+        logError( "could not write " + file );
+        return -1;
+    }
+
+    return 0;
+}
+
+inline int xlinqCal::savePokes()
+{
+    int nPoke = m_pokeLast - m_pokeFirst + 1;
+
+    mx::improc::eigenCube<float> applied( m_pokes.rows(), m_pokes.cols(), nPoke );
+
+    for( int k = 0; k < nPoke; ++k )
+    {
+        applied.image( k ) = m_pokeAmp * m_pokes.image( m_pokeFirst + k );
+    }
+
+    mx::fits::fitsHeader<> head = m_pokeHead;
+    head.eraseStandardTop();
+    head.append( "XLQVERS", std::string( XLINQCAL_GIT_VERSION ), "xlinqCal version" );
+    head.append( "POKEFILE", m_pokeFile, "source poke file; its header cards precede these" );
+    head.append( "POKEAMP", m_pokeAmp, "multiplier applied to the poke file" );
+    head.append( "POKE0", m_pokeFirst, "poke file index of first plane" );
+    head.append( "NPOKEREQ", nPoke, "number of pokes requested" );
+    head.append( "PRODUCT", std::string( "applied pokes: POKEAMP * poke file planes [um]" ), "content of this cube" );
+
+    std::string               file = outputPath( "_pokes.fits" );
+    mx::fits::fitsFile<float> ff;
+
+    if( ff.write( file, applied, head ) != mx::error_t::noerror )
     {
         logError( "could not write " + file );
         return -1;

@@ -5,3 +5,4 @@ xlinqSim
 tests/xlinqCal_test
 *.o
 xlsim_*.fits
+try*/
