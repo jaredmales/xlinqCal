@@ -194,6 +194,8 @@ With $S = \sum_k c_k G_k$ (field linear in the modal coefficients), a ± poke se
 | odd part $\tfrac12[I(+c)-I(-c)]$ | $2\,\mathrm{Re}(C^*S)$ | **yes**: the pinned-speckle cross term |
 | even part $\tfrac12[I(+c)+I(-c)]-I(0)$ | $\lvert S\rvert^2$ | **no**: the target |
 
+At second order the even part also contains the C-dependent dimming term $2\,\mathrm{Re}(C^*S_2)$; it was measured in try1 (§9.10).
+
 Consequences:
 - **What xlinqCal saves now is the C-dependent term.** The current product, the odd part, is exactly the piece you expect to change between coronagraph and dark-hole configurations. On the camsci1 side it isn't the |S|² mapping. On the camwfs side it remains essential: it gives $\mathbf R_w$ and the reconstructor $z = \mathbf R_w^+(x-x_0)$.
 - **The even part is required, not optional.** For your goal, the §5.1 change (save both sign means plus an interleaved $I(0)$) is the core of the calibration. The single-mode even parts are $|G_k|^2 = |S_k|^2$, one C-independent speckle image per mode. That is the diagonal of the |S|² quadratic form.
@@ -213,7 +215,7 @@ Reference LinQ (train/test split on the probe data) is a good baseline, as you s
 For the calibration I recommend the **Fourier basis**, even if KL is used elsewhere:
 - **Locality.** A Fourier mode's |S_k|² is a speckle pair at $\pm f$, so each pixel couples to only $m \approx 2\pi r^2$ modes (r in λ/D): about 25 at r = 2, 57 at r = 3. KL modes for an isotropic von Kármán PSD are nearly degenerate across orientation at fixed |f|, so they mix Fourier modes around a ring. Their speckles spread in azimuth, and each pixel then couples to about $2\pi|\xi|\cdot 2r$ modes (≈ 150 at $|\xi|$ = 12 λ/D, r = 2, versus ≈ 25 for Fourier). That costs roughly 6× in probe count (approach 1) or about 40× in cross-term unknowns (approach 2).
 - **No information is lost.** KL is a fixed linear transform $T$ of the Fourier modes, so $z_{\rm KL} = T^{-1} z_{\rm F}$ and $\mathbf G_{\rm KL} = \mathbf G_{\rm F} T$ are exact. Only the measured diagonals $|G_k|^2$ are basis-specific, and they are more useful in the Fourier basis.
-- **Overcomplete set.** The 2400 modes are the $(2\cdot24+1)^2 - 1$ frequency points of the square Nyquist region $|u|,|v| \le 24$ cycles/pupil (the user's clarification). On the actuator grid, the $\pm24$ edges are degenerate: they alias onto each other, and sin vanishes at Nyquist. Only the illuminated actuators (≲ 2040 active) carry signal. So the set is linearly dependent, and $\mathbf R_w$ has a numerical null space. That's fine if $z$ comes from a truncated pseudo-inverse and the same $z$ convention is used to fit and apply $\mathbf G$. $S = \mathbf G z$ is then unique even though $z$ is not.
+- **Overcomplete set.** The 2400 modes are the $(2\cdot24+1)^2 - 1$ frequency points of the square Nyquist region $|u|,|v| \le 24$ cycles/pupil (the user's clarification). (try1 showed the modes are cycles per 50-actuator grid; see §9.10.) On the actuator grid, the $\pm24$ edges are degenerate: they alias onto each other, and sin vanishes at Nyquist. Only the illuminated actuators (≲ 2040 active) carry signal. So the set is linearly dependent, and $\mathbf R_w$ has a numerical null space. That's fine if $z$ comes from a truncated pseudo-inverse and the same $z$ convention is used to fit and apply $\mathbf G$. $S = \mathbf G z$ is then unique even though $z$ is not.
 
 Is there a reason the calibration itself needs KL (e.g. SNR ordering)? If so, a KL calibration still works with approaches 1–3, at the cost above.
 
@@ -267,3 +269,27 @@ Suggestion: use the normalized, reference-subtracted WFS frames instead of raw c
   - **Basis:** $z$ is in the loop's control-mode basis (KL, if that is what aol1 uses). For locality (§9.3), transform to Fourier coordinates with the known KL↔Fourier matrix before fitting. The model is linear in the field, so this is exact.
   - **Calibration of $z$:** the per-poke odd part of `modevalWFS` is the loop's modal response to each poke (≈ amp·e_k if the poke basis equals the control basis). Its even part shows the WFS/reconstructor nonlinearity in modal space.
   - **Truncation:** modes the loop doesn't control are absent from $z$, so the model cannot predict their speckles. The pixel-level `imWFS2pub` products are kept as a fallback and a check.
+
+### 9.10 Findings from the first instrument data set, try1 (2026-11-19)
+Data set `try1/xlinqCal_20261119_001`: 2400 Fourier modes, amp 0.05 µm rms, camsci1 at 26.5 Hz, `nFrames=2`, `nRepeat=1`, 18 min. Bookkeeping is in `initial_plan.md` §5.7. Findings that affect this analysis:
+
+- **Mode frequency units.** The modes in `modFourier_48.fits` are integer cycles **per 50 actuators** (`fillFourierBasis(modes, 50, …)`), with $|n_x|, |n_y| \le 24$. Read "cycles/pupil" in §9.3 and "48 λ/D" in §9.4 as cycles per 50-actuator grid. Converting to cycles per pupil needs the illuminated pupil diameter in actuators.
+- **Measured camsci1 geometry.** Speckle positions follow pix = M·n with M ≈ [[3.92, 2.03], [−2.03, 3.72]] px per (cycle/50 act). That is 4.43 / 4.27 px per cycle/50 (slightly anisotropic), rotation ≈ −27.5°, det > 0 (no flip), fit residual 0.7 px. `tools/shape_pokes.py` refits it and records it in the shaped cube header (GEOMij).
+- **The even part is not pure |S|².** At second order, $e^{i\varphi} \approx 1 + i\varphi - \varphi^2/2$ adds $S_2 \propto -\tfrac12 \mathcal F\{P\varphi^2\}$, and $2\,\mathrm{Re}(C^*S_2)$ is even in the poke. For a single mode it dims the reference by the energy put into the speckles: even $\approx |S|^2 - \varepsilon\,|C|^2$. In try1, the even image outside the speckles fits $-\varepsilon\cdot$ref with $\varepsilon/E$ ≈ 1.7 (IQR 1.4–2.0; E = speckle energy as a fraction of the PSF). The net even flux is ≈ 0.03 E, so energy is conserved. Beyond ~8 λ/D, the dimming term is the dominant even signal (the stacked speckle profile goes negative there). Consequences:
+  - Estimate $|S_k|^2 \approx \mathrm{even}_k + \varepsilon_k\,\mathrm{ref}$, with $\varepsilon_k$ fitted per mode, or include the term in the model.
+  - The term is C-dependent, so it is part of what changes between configurations (§9.6). With a coronagraph in, $|C|^2$ is small and so is the term.
+  - For multi-mode probes (§9.1), $S_2$ also has cross terms at $f_a \pm f_b$, which interfere with $C$. The probe even part is $|\mathbf G c|^2 + 2\,\mathrm{Re}(C^* S_2(c))$, not $|\mathbf G c|^2$ alone. Approach 1 needs this term (or a dark hole) when fitting $\mathbf G$.
+- **Amplitude.** At 0.05 µm, low-order speckles carry ~20% of the PSF flux, which is too large for the quadratic regime. Speckle energy falls 67× toward the corners. `tools/shape_pokes.py` makes a shaped cube (target 1% per mode, cap 0.05 µm): 0.010 µm at low order, the cap for $|n| \ge 24$. See `initial_plan.md` §5.7.
+- **WFS even/odd ratio** (rms of the even part over rms of the odd part, per mode): ≈ 0.5 for `aol1_imWFS2pub`, ≈ 0.27 for `aol1_modevalWFSpub`. That is a sizable WFS nonlinearity at 0.05 µm, so using the odd part for $z$ (§9.6) matters. In modal space each Fourier poke spreads over many control modes: the largest coefficient carries only ~4%, consistent with a KL control basis (§9.3, §9.9). Modes with $|n| > 28$ respond ~8× more weakly in `modeval`.
+
+**Rejected: poking two or four Fourier modes at once.** The idea was to poke mode pairs $f$ and $R_{90}f = (-v, u)$ (and quads at 45° above some cutoff), whose speckles fall in different camsci1 pixels. The data supported it on the camsci1 side above $|n| \approx 8$–10:
+- The worst-case speckle cross term was ≈ 2% of a speckle peak at $|n| = 10$.
+- The stacked speckle profile is below $10^{-3}$ of the peak beyond ~5 λ/D.
+- It would have saved 44% of pokes with pairs above 10, or 62% with quads above 14.
+
+**Decision (user): rejected, because the WFS responses cannot be split per mode.** In both `imWFS2pub` and `modevalWFS` the two modes overlap, so 2400 per-mode WFS responses need 2400 independent pokes:
+- Poking $a+b$ and $a-b$ separates the modes exactly, in both the WFS and the even part, but saves nothing.
+- Separating by spatial frequency in the pupil images, or projecting `modeval` onto Fourier modes, assumes a clean WFS response structure that the calibration is meant to measure.
+- A separate WFS-only calibration loses the simultaneous WFS and camsci1 measurement.
+
+Time savings must come from amplitude shaping and the choice of `nFrames` and `nRepeat`.
