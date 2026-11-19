@@ -1,0 +1,226 @@
+% the math from Sandrine's paper
+
+\subsection{LinQ algorithm}
+
+LinQ (Linear Quadratic) aims to construct a predictive model that relates WFS measurements to the corresponding high-contrast focal-plane images (HC). The approach models their quadratic relationship by performing linear regression in a quadratically expanded feature space, while mitigating the high dimensionality of the data through dimensionality reduction using PCA.
+
+The method consists of a learning stage, during which the model is trained using a \textbf{reference dataset}
+\[
+\left\{ \left(\mathbf{WFS}^{\mathrm{REF}}_j,\ \mathbf{Img}^{\mathrm{REF}}_j \right) \right\}_{j=1}^{N_{\mathrm{REF}}},
+\]
+and a prediction stage in which the trained model is used to estimate the HC response for \textbf{science dataset} observations
+\[
+\left\{ \left(\mathbf{WFS}^{\mathrm{SCI}}_k,\ \mathbf{Img}^{\mathrm{SCI}}_k \right) \right\}_{k=1}^{N_{\mathrm{SCI}}},
+\]
+where,\(\mathbf{WFS}^{\mathrm{REF}}_j\) and \(\mathbf{Img}^{\mathrm{REF}}_j\) denote synchronized wavefront sensor and high-contrast 2D images in the reference set. Similarly, \(\mathbf{WFS}^{\mathrm{SCI}}_k\) and \(\mathbf{Img}^{\mathrm{SCI}}_k\) denote synchronized WFS and HC 2D images in the science set. \(N_{\mathrm{REF}}\) and \(N_{\mathrm{SCI}}\) denote the number of synchronized frame pairs in the reference and science datasets, respectively.
+
+We denote by \(\mathbf{X}\) the WFS measurements and by \(\mathbf{Y}\) the corresponding HC images. Each two-dimensional frame is reshaped into a one-dimensional vector, so that the reference dataset can be written as
+\[
+\mathbf{X}_{\mathrm{ref}} \in \mathbb{R}^{N_{\mathrm{ref}} \times p},
+\qquad
+\mathbf{Y}_{\mathrm{ref}} \in \mathbb{R}^{N_{\mathrm{ref}} \times q},
+\]
+where \(p\) and \(q\) denote the number of pixels in the vectorized WFS and HC images, respectively, and \(N_{\mathrm{ref}}\) is the number of reference frames.
+
+The \(i\)-th rows of these matrices, denoted \(\mathbf{X}_{\mathrm{ref}}^{i}\) and \(\mathbf{Y}_{\mathrm{ref}}^{i}\), correspond to the flattened WFS and HC frames acquired at the same time instance. The datasets are assumed to be temporally synchronized.
+
+Similarly, we define
+\[
+\mathbf{X}_{\mathrm{sci}} \in \mathbb{R}^{N \times p},
+\qquad
+\mathbf{Y}_{\mathrm{sci}} \in \mathbb{R}^{N \times q},
+\]
+as a sequence of synchronized WFS and HC frames that are not part of the training set (e.g., a science sequence that may contain circumstellar signals).
+
+
+To simplify notation, we introduce normalization operators defined from the reference statistics:
+\begin{equation}
+\mathcal{N}_X(\mathbf{X})
+=
+\frac{\mathbf{X} - \bar{\mathbf{X}}_{\mathrm{ref}}}
+{\sigma_{X_{\mathrm{ref}}}}, \quad
+\mathcal{N}_Y(\mathbf{Y})
+=
+\frac{\mathbf{Y} - \bar{\mathbf{Y}}_{\mathrm{ref}}}
+{\sigma_{Y_{\mathrm{ref}}}},
+\end{equation}
+
+where subtraction and division are performed pixel-wise. The quantities
+\(
+\bar{\mathbf{X}}_{\mathrm{ref}}
+\)
+and
+\(
+\bar{\mathbf{Y}}_{\mathrm{ref}}
+\)
+denote the temporal mean image of the respective reference and target datasets,
+\(
+\sigma_{X_{\mathrm{ref}}}
+\)
+and
+\(
+\sigma_{Y_{\mathrm{ref}}}
+\)
+denote the global standard deviations of the datasets, computed over both the temporal and spatial dimensions.
+
+Finally, we denote by
+\(
+\hat{\mathbf{Y}}_{\mathrm{sci}}
+\)
+the predicted HC sequence corresponding to a given WFS measurement
+\(
+\mathbf{X}_{\mathrm{sci}}
+\).
+
+The training workflow of the method is illustrated in Fig.~\ref{fig:TrainingDataFlow}.
+
+\begin{figure}[t]
+\begin{center}
+\includegraphics[width=\textwidth]{Images/LinQTrainingVersion2.pdf}
+\end{center}
+\caption{
+Training data flow of the LinQ algorithm: Linear regression in a quadratically expanded feature space to map WFS telemetry to focal-plane images. The three major procedural steps are outlined by red headings: dimension reduction, quadratic expansion, and linear regression. The dimensionality and shapes of the data matrices are indicated by black mathematical notation next to or inside the corresponding blocks. Black text with a gray background provides functional descriptions of what each vector or matrix represents. The color coding is as follows: Blue boxes represent WFS telemetry products. Green boxes represent high-contrast focal-plane products. Yellow box represents the learned model in the quadratically expanded reduced space.}
+\label{fig:TrainingDataFlow}
+\end{figure}
+
+First (Step 1 in Fig.~\ref{fig:TrainingDataFlow}), we apply PCA to reduce the dimensionality of the WFS dataset while preserving its dominant variance. PCA identifies an orthogonal basis in which the data variance is maximized along successive directions, called principal components (PC). 
+
+In practice, this basis is computed via the singular value decomposition (SVD) of the normalized reference data matrix,
+\(
+\mathcal{N}_X(\mathbf{X}_{\mathrm{ref}})
+=
+\mathbf{U}\mathbf{\Sigma}\mathbf{V}^\top,
+\)
+where the columns of \(\mathbf{V}\) are the PC and the singular values in \(\mathbf{\Sigma}\) quantify the variance explained by each mode. Retaining only the first \(n_{\mathrm{comp}}^x\) components defines a reduced orthogonal basis
+\(
+\mathbf{V}_X \in \mathbb{R}^{p \times n_{\mathrm{comp}}^x}
+\),
+onto which the data are projected.
+
+Applying PCA to the normalized WFS reference data yields
+\begin{equation}
+\mathbf{Z}_{\mathrm{ref}}
+=
+\mathcal{N}_X(\mathbf{X}_{\mathrm{ref}})
+\mathbf{V}_X,
+\end{equation}
+
+where 
+\(
+\mathbf{Z}_{\mathrm{ref}} \in \mathbb{R}^{N_{\mathrm{ref}} \times n_{\mathrm{comp}}^x}
+\) contains the projection coefficients of the reference WFS frames onto the reduced WFS feature basis, whose components are given by $\mathbf{V}_X,$
+
+% PCA can be applied to the HC reference data:
+% \begin{equation}
+% \mathbf{W}_{\mathrm{ref}}
+% =
+% \mathcal{N}_Y(\mathbf{Y}_{\mathrm{ref}})
+% \mathbf{V}_Y,
+% \end{equation}
+
+% where
+% \(
+% \mathbf{U}_Y \in \mathbb{R}^{q \times n_{\mathrm{comp}}^y}
+% \)
+% and
+% \(
+% \mathbf{W}_{\mathrm{ref}} \in \mathbb{R}^{N_{\mathrm{ref}} \times n_{\mathrm{comp}}^y}.
+% \)
+
+% However,  in practice this operation is not recommended, as projecting HC images onto a reduced basis reduces interpolation capability and constrains the predicted image to lie within the same subspace. 
+
+Secondly (Step 2 in Fig.~\ref{fig:TrainingDataFlow}), we expand the reduced WFS coefficients into a quadratic feature space to capture quadratic relationships between the WFS and HC signals. For each row of $\mathbf{Z}_{\mathrm{ref}}$, containing the projection coefficients $z_{i \in [0, n_{\mathrm{comp}}^x]}$ for a single frame of the reference set, the corresponding row of the quadratically expanded matrix $\mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}})$ includes all first- and second-order monomials:
+\begin{equation}
+\left[
+z_i,\;
+z_i z_j
+\right]_{\forall i,j \in [0, n_{\mathrm{comp}}^x],\; i \le j},
+\end{equation}
+where the condition $i \leq j$ ensures that each quadratic term is included only once (e.g., $z_0z_1$ is included, whereas $z_1z_0$ is omitted). This mapping explicitly includes all linear and quadratic terms required to represent a second-order polynomial relationship. No additional constant term is required because the normalized inputs $\mathcal{N}_X(\mathbf{X}_{\mathrm{ref}})$ and $\mathcal{N}_Y(\mathbf{Y}_{\mathrm{ref}})$ are centered.
+
+The resulting feature matrix has dimension
+\(
+N_{\mathrm{ref}} \times d_\Phi
+\),
+where \(d_\Phi\) denotes the number of WFS LinQ features used to map wavefront sensor (WFS) measurements to the image plane, corresponding to the number of parameters to be estimated per pixel in the HC image plane : 
+\begin{equation}
+d_\Phi =
+n_{\mathrm{comp}}^x +
+\frac{n_{\mathrm{comp}}^x \left(n_{\mathrm{comp}}^x+1\right)}{2}.
+\end{equation}
+
+Finally (Step 3 in Fig.~\ref{fig:TrainingDataFlow}), the quadratic expansion, i.e. the expansion of a second-order polynomial form, enables us to reformulate the mapping as a linear system :
+
+\begin{equation}
+\mathcal{N}_Y(\mathbf{Y}_{\mathrm{ref}}) = \mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}}) \mathbf{A}.
+\end{equation}
+where $\mathbf{A} \in \mathbb{R}^{d_\Phi \times q}$ %(or $\mathbf{A} \in \mathbb{R}^{d_\Phi \times n_{\mathrm{comp}}^y}$ if PCA reduction has been applied to the HC frames) 
+is the regression matrix. 
+
+If the number of training samples $N_{\mathrm{ref}}$ is significantly larger than the number of dimensions $d_\Phi$, the system is over-determined and can be solved using ordinary least squares (OLS). The closed-form solution is given by:
+\begin{equation}
+\mathbf{A} = \left( \mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}})^\top \mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}}) \right)^{-1} \mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}})^\top \mathcal{N}_Y(\mathbf{Y}_{\mathrm{ref}}).
+\end{equation}
+
+However, in many practical scenarios, especially after quadratic expansion, the dimensionality of the feature space $d_\Phi$ can approach or exceed the number of available samples ($d_\Phi > N_{\mathrm{ref}}$). This leads to an ill-posed problem where $\mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}})^\top \mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}})$ becomes singular or poorly conditioned, making the solution unstable and prone to overfitting. To ensure stability, we employ Ridge Regularization (also known as Tikhonov regularization or L2 regularization)\cite{HoerlKennard1970}, which requires inverting an $N_{\mathrm{ref}} \times N_{\mathrm{ref}}$ matrix:
+\begin{equation}
+\mathbf{A} = \mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}})^\top \left( \mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}}) \mathbf{\Phi}(\mathbf{Z}_{\mathrm{ref}})^\top + \lambda \mathbf{I} \right)^{-1} \mathcal{N}_Y(\mathbf{Y}_{\mathrm{ref}}).
+\end{equation}
+
+We also implement an automatic computation of the optimal regularization parameter $\lambda$, relative to the spectral norm of the feature matrix. Specifically, the algorithm first calculates the feature covariance
+\begin{equation}
+    \mathbf{Z}_{\mathrm{ref}}^\top \mathbf{Z}_{\mathrm{ref}},
+\end{equation}
+and then performs an eigen decomposition to obtain the eigenvalues. 
+The largest eigenvalue, $\lambda_{\rm max}$, represents the spectral norm, capturing the maximum variance in the features. The ridge factor $\lambda$ is then set automatically according to
+\begin{equation}
+    \lambda = \text{reg\_factor} \times (\epsilon \times d_\Phi \times \lambda_{\rm max}),
+\end{equation}
+where $\lambda_{\rm max}$ captures the dominant variance in the data, $\epsilon$ is the machine epsilon ensuring a numerically safe shift, and $\text{reg\_factor}$ is a user-defined multiplier. By default, 
+${\rm reg\_factor}=1$, but it can be manually adjusted if the automatic scaling does not produce satisfactory regularization.
+
+%% I am not mentioning smoothing nor "detector pixel is treated independently" things
+% When performing regression directly in pixel space (i.e., without Y-PCA reduction), each detector pixel is treated independently. To incorporate the prior that the PSF is smooth and spatially continuous (e.g., neighboring pixels are correlated), we can optionally apply spatial smoothing on the learned weight maps. This is implemented as a Laplacian smoothing operator applied to the regression weights, acting on each column of \(\mathbf{A}\) after reshaping it into its 2D spatial layout:
+
+% \begin{equation}
+% \mathbf{A}_{\mathrm{smooth}} \approx \mathbf{A} - \eta \nabla^2 \mathbf{A},
+% \end{equation}
+
+% where \( \nabla^2 \) denotes the discrete 2D Laplacian applied to each reshaped spatial weight map (i.e., each column of \(\mathbf{A}\) is first reshaped into image form before filtering), and \( \eta \) controls the strength of the smoothing.
+
+The prediction workflow is illustrated in Fig.~\ref{fig:PredictionDataFlow}.
+A new WFS sequence is normalized, projected onto the PCA basis (step 1 in Fig.~\ref{fig:PredictionDataFlow}), expanded quadratically (step 2 in Fig.~\ref{fig:PredictionDataFlow}), passed through the transformation $\mathbf{A}$ (step 3 in Fig.~\ref{fig:PredictionDataFlow}) and de-normalized to obtain the final predicted frames:
+
+\begin{equation}
+\hat{\mathbf{Y}}_{\mathrm{sci}}
+=
+\mathcal{N}_{Y}^{-1}
+\left(
+\mathbf{\Phi}
+\left(
+\mathcal{N}_X(\mathbf{X_{\mathrm{sci}}}) \mathbf{V}_X
+\right) \mathbf{A}
+\right).
+\end{equation}
+
+\begin{figure}[!ht]
+\begin{center}
+\includegraphics[width=\textwidth]{Images/LinQPredictionVersion2.pdf}
+\end{center}
+\caption{
+\label{fig:PredictionDataFlow}
+Prediction pipeline of the LinQ algorithm: Estimation of focal-plane PSF variations from new WFS measurements using a pretrained model. The processing steps mirror the training workflow with the key difference that the learned model is now applied as a fixed transformation to incoming telemetry sequences rather than being fitted. Data dimensions, matrix shapes, and color coding are kept consistent with the training pipeline representation in Figure~\ref{fig:TrainingDataFlow}.
+}
+\end{figure}
+
+\subsection{Implementation Details}
+
+The proposed algorithm is implemented in C for high-performance processing, leveraging established numerical libraries for linear algebra:
+\begin{itemize}
+    \item \textbf{LAPACK/BLAS:} Used for matrix operations, including SVD for PCA and Ridge Regression solvers (via Cholesky decomposition or SVD-based least squares).
+    \item \textbf{CFITSIO:} Handles reading and writing of Flexible Image Transport System (FITS) files, which serve as the standard data format for telemetry and images.
+\end{itemize}
+
+The software architecture is split into two primary components. The fitting module (\texttt{wfs2psf\_fit}) performs the training stage: reading the reference datasets, computing the PCA bases, expanding the telemetry space, and solving for the transformation matrix \(\mathbf{A}\). The model parameters (projection bases, means, and regression weights) are exported as a set of FITS files. The prediction module (\texttt{wfs2psf\_predict}) then loads these model files and applies the transformation to new telemetry sequences.
+
+The tools are publicly available at https://github.com/Sand-jrd/WFS2PSF-LinQmodel.git
