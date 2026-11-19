@@ -83,6 +83,13 @@ struct xlinqSimConfig
 
     std::string sciName{ "xlsim_camsci1" }; ///< The simulated science camera, float.
 
+    std::string modevalName; ///< Optional modal-coefficient stream (float, nModes x 1), like aol1_modevalWFSpub. Empty
+                             ///< disables.
+
+    uint32_t nModes{ 64 }; ///< Number of simulated modal coefficients.
+
+    double modevalNoise{ 0.001 }; ///< Per-frame noise rms of the modal coefficients [microns].
+
     uint32_t dmRows{ 50 }; ///< DM first dimension.
 
     uint32_t dmCols{ 50 }; ///< DM second dimension.
@@ -113,6 +120,8 @@ struct xlinqSimConfig
 
     double sciGain{ 50 }; ///< rms camsci1 response to a 1 micron rms poke [counts].
 
+    double sciQuadGain{ 0 }; ///< rms of |H c| for a 1 micron rms poke; camsci1 adds |H c|^2 [counts]. 0 disables.
+
     double wfsNoise{ 2 }; ///< camwfs per-frame noise rms [counts].
 
     double sciNoise{ 2 }; ///< camsci1 per-frame noise rms [counts].
@@ -124,7 +133,8 @@ struct xlinqSimConfig
 
 /// Simulates dmcomb, camwfs, and camsci1 with known linear responses to the DM.
 /** Each camera frame is `level*(1 + drift*t) + R * dm + noise`, where `dm` is the combined DM
- * stream. camsci1 frames average the DM state over the exposure, so a poke during an exposure
+ * stream. camsci1 optionally adds `|H dm|^2` with H complex (`sciQuadGain`), a stand-in for the
+ * speckle intensity |S|^2. camsci1 frames average the DM state over the exposure, so a poke during an exposure
  * partially contaminates that frame, as on the instrument. camsci1 frames are posted
  * `sciPostDelay` after the exposure ends, so a poke made just after a post lands partway into
  * the next exposure, as with readout and shmimTCP latency.
@@ -146,9 +156,17 @@ class xlinqSim
 
     simStream m_sci; ///< The camsci1 stream, float.
 
+    simStream m_modeval; ///< The optional modal-coefficient stream, float, written with each camwfs frame.
+
+    mx::improc::eigenImage<float> m_modevalR; ///< Modal response matrix, nModes x nAct, coefficient per micron.
+
     mx::improc::eigenImage<float> m_wfsR; ///< camwfs response matrix, nWfsPix x nAct, counts per micron.
 
     mx::improc::eigenImage<float> m_sciR; ///< camsci1 response matrix, nSciPix x nAct, counts per micron.
+
+    mx::improc::eigenImage<float> m_sciHr; ///< Real part of the camsci1 quadratic field response, nSciPix x nAct.
+
+    mx::improc::eigenImage<float> m_sciHi; ///< Imaginary part of the camsci1 quadratic field response.
 
     ///@}
 
@@ -161,6 +179,8 @@ class xlinqSim
     mx::improc::eigenImage<float> m_wfsSig; ///< Current camwfs response to the combined DM, nWfsPix x 1.
 
     mx::improc::eigenImage<float> m_sciSig; ///< Current camsci1 response to the combined DM, nSciPix x 1.
+
+    mx::improc::eigenImage<float> m_modevalSig; ///< Current modal coefficients of the combined DM, nModes x 1.
 
     std::atomic<bool> m_run{ false }; ///< True while the threads should run.
 
@@ -194,6 +214,15 @@ class xlinqSim
 
     /// Get the camsci1 response matrix, nSciPix x nAct.
     const mx::improc::eigenImage<float> &sciR() const;
+
+    /// Get the modal response matrix, nModes x nAct.
+    const mx::improc::eigenImage<float> &modevalR() const;
+
+    /// Get the real part of the camsci1 quadratic field response, nSciPix x nAct.
+    const mx::improc::eigenImage<float> &sciHr() const;
+
+    /// Get the imaginary part of the camsci1 quadratic field response, nSciPix x nAct.
+    const mx::improc::eigenImage<float> &sciHi() const;
 
     /// Make a cube of random shapes, each normalized to 1 micron rms.
     static mx::improc::eigenCube<float> randomPokes( uint32_t rows, /**< [in] DM first dimension */
@@ -269,12 +298,22 @@ inline void simStream::post()
 
 inline xlinqSim::xlinqSim( const xlinqSimConfig &cfg ) : m_cfg( cfg )
 {
-    for( const std::string &n : { cfg.dmChannel, cfg.dmComb, cfg.wfsName, cfg.sciName } )
+    auto checkPrefix = [&cfg]( const std::string &n )
     {
-        if( n.compare( 0, cfg.prefix.size(), cfg.prefix ) != 0 || cfg.prefix.empty() )
+        if( cfg.prefix.empty() || n.compare( 0, cfg.prefix.size(), cfg.prefix ) != 0 )
         {
             throw std::invalid_argument( "simulated stream " + n + " must start with prefix '" + cfg.prefix + "'" );
         }
+    };
+
+    for( const std::string &n : { cfg.dmChannel, cfg.dmComb, cfg.wfsName, cfg.sciName } )
+    {
+        checkPrefix( n );
+    }
+
+    if( !cfg.modevalName.empty() )
+    {
+        checkPrefix( cfg.modevalName );
     }
 
     size_t nAct = cfg.dmRows * cfg.dmCols;
@@ -300,6 +339,29 @@ inline xlinqSim::xlinqSim( const xlinqSimConfig &cfg ) : m_cfg( cfg )
             return sciScale * norm( gen );
         } );
 
+    // Each of Hr and Hi gives sciQuadGain/sqrt(2) rms, so |H c| has rms sciQuadGain for a 1 micron rms shape
+    float quadScale = cfg.sciQuadGain / sqrt( 2.0 * nAct );
+
+    m_sciHr.resize( m_sciR.rows(), nAct );
+    m_sciHi.resize( m_sciR.rows(), nAct );
+
+    auto quadDraw = [&]( float )
+    {
+        return quadScale * norm( gen );
+    };
+
+    m_sciHr = m_sciHr.unaryExpr( quadDraw );
+    m_sciHi = m_sciHi.unaryExpr( quadDraw );
+
+    // Modal coefficients of order 1 for a 1 micron rms shape
+    m_modevalR.resize( cfg.nModes, nAct );
+    m_modevalR = m_modevalR.unaryExpr(
+        [&]( float )
+        {
+            return norm( gen ) / static_cast<float>( sqrt( nAct ) );
+        } );
+    m_modevalSig.setZero( cfg.nModes, 1 );
+
     m_wfsSig.resize( m_wfsR.rows(), 1 );
     m_sciSig.resize( m_sciR.rows(), 1 );
     m_wfsSig.setZero();
@@ -317,6 +379,11 @@ inline void xlinqSim::start()
     m_comb.create( m_cfg.dmComb, _DATATYPE_FLOAT, m_cfg.dmRows, m_cfg.dmCols );
     m_wfs.create( m_cfg.wfsName, _DATATYPE_UINT16, m_cfg.wfsRows, m_cfg.wfsCols );
     m_sci.create( m_cfg.sciName, _DATATYPE_FLOAT, m_cfg.sciRows, m_cfg.sciCols );
+
+    if( !m_cfg.modevalName.empty() )
+    {
+        m_modeval.create( m_cfg.modevalName, _DATATYPE_FLOAT, m_cfg.nModes, 1 );
+    }
 
     m_t0  = std::chrono::steady_clock::now();
     m_run = true;
@@ -342,6 +409,7 @@ inline void xlinqSim::stop()
     m_comb.destroy();
     m_wfs.destroy();
     m_sci.destroy();
+    m_modeval.destroy();
 }
 
 inline const mx::improc::eigenImage<float> &xlinqSim::wfsR() const
@@ -352,6 +420,21 @@ inline const mx::improc::eigenImage<float> &xlinqSim::wfsR() const
 inline const mx::improc::eigenImage<float> &xlinqSim::sciR() const
 {
     return m_sciR;
+}
+
+inline const mx::improc::eigenImage<float> &xlinqSim::modevalR() const
+{
+    return m_modevalR;
+}
+
+inline const mx::improc::eigenImage<float> &xlinqSim::sciHr() const
+{
+    return m_sciHr;
+}
+
+inline const mx::improc::eigenImage<float> &xlinqSim::sciHi() const
+{
+    return m_sciHi;
 }
 
 inline mx::improc::eigenCube<float> xlinqSim::randomPokes( uint32_t rows, uint32_t cols, int n, unsigned seed )
@@ -408,8 +491,14 @@ inline void xlinqSim::combThreadExec()
 
         { //mutex scope
             std::lock_guard<std::mutex> lock( m_sigMutex );
-            m_wfsSig = ( m_wfsR.matrix() * cmd ).array();
-            m_sciSig = ( m_sciR.matrix() * cmd ).array();
+            m_wfsSig     = ( m_wfsR.matrix() * cmd ).array();
+            m_modevalSig = ( m_modevalR.matrix() * cmd ).array();
+            m_sciSig     = ( m_sciR.matrix() * cmd ).array();
+
+            if( m_cfg.sciQuadGain > 0 )
+            {
+                m_sciSig += ( m_sciHr.matrix() * cmd ).array().square() + ( m_sciHi.matrix() * cmd ).array().square();
+            }
         }
 
         m_comb.post();
@@ -425,6 +514,9 @@ inline void xlinqSim::wfsThreadExec()
 
     size_t                        nPix = m_cfg.wfsRows * m_cfg.wfsCols;
     mx::improc::eigenImage<float> frame( nPix, 1 );
+    mx::improc::eigenImage<float> modes( m_cfg.nModes, 1 );
+
+    std::normal_distribution<float> modeNorm( 0, m_cfg.modevalNoise );
 
     auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>( 1.0 / m_cfg.wfsFps ) );
@@ -440,6 +532,7 @@ inline void xlinqSim::wfsThreadExec()
         { //mutex scope
             std::lock_guard<std::mutex> lock( m_sigMutex );
             frame = level + m_wfsSig;
+            modes = m_modevalSig;
         }
 
         frame = frame.unaryExpr(
@@ -457,6 +550,18 @@ inline void xlinqSim::wfsThreadExec()
         }
 
         m_wfs.post();
+
+        // The modal coefficients are computed from each camwfs frame, as in the loop
+        if( !m_cfg.modevalName.empty() )
+        {
+            m_modeval.setWrite();
+            Eigen::Map<Eigen::ArrayXf>( m_modeval.data<float>(), m_cfg.nModes ) = modes.unaryExpr(
+                [&]( float v )
+                {
+                    return v + modeNorm( gen );
+                } );
+            m_modeval.post();
+        }
     }
 }
 

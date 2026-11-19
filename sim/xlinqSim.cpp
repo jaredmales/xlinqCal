@@ -33,6 +33,8 @@ class xlinqSimApp : public mx::app::application
 
     int m_nPokes{ 10 }; ///< Number of random pokes written to `<prefix>pokes.fits`.
 
+    int m_nModes{ 0 }; ///< Number of simulated modal coefficients in `<prefix>modevalWFS`, 0 disables.
+
   public:
     /// Set up the configuration targets.
     virtual void setupConfig();
@@ -93,6 +95,25 @@ inline void xlinqSimApp::setupConfig()
                 false,
                 "float",
                 "camwfs rms response to 1 um rms [counts]. Default 50." );
+    config.add(
+        "sim.nModes",
+        "",
+        "sim.nModes",
+        argType::Required,
+        "sim",
+        "nModes",
+        false,
+        "int",
+        "Number of modal coefficients in <prefix>modevalWFS (like aol1_modevalWFSpub), 0 disables. Default 0." );
+    config.add( "sim.sciQuadGain",
+                "",
+                "sim.sciQuadGain",
+                argType::Required,
+                "sim",
+                "sciQuadGain",
+                false,
+                "float",
+                "camsci1 rms |H c| for 1 um rms; adds |H c|^2 [counts]. Default 0 (off)." );
     config.add( "sim.drift",
                 "",
                 "sim.drift",
@@ -120,6 +141,8 @@ inline void xlinqSimApp::loadConfig()
     config( m_cfg.sciFps, "sim.sciFps" );
     config( m_cfg.sciGain, "sim.sciGain" );
     config( m_cfg.wfsGain, "sim.wfsGain" );
+    config( m_nModes, "sim.nModes" );
+    config( m_cfg.sciQuadGain, "sim.sciQuadGain" );
     config( m_cfg.drift, "sim.drift" );
     config( m_nPokes, "sim.nPokes" );
 
@@ -127,6 +150,12 @@ inline void xlinqSimApp::loadConfig()
     m_cfg.dmComb    = m_cfg.prefix + "dm01disp";
     m_cfg.wfsName   = m_cfg.prefix + "camwfs";
     m_cfg.sciName   = m_cfg.prefix + "camsci1";
+
+    if( m_nModes > 0 )
+    {
+        m_cfg.nModes      = m_nModes;
+        m_cfg.modevalName = m_cfg.prefix + "modevalWFS";
+    }
 }
 
 inline int xlinqSimApp::execute()
@@ -141,13 +170,25 @@ inline int xlinqSimApp::execute()
         mx::fits::fitsFile<float> ff;
         ff.write( m_cfg.prefix + "wfsR.fits", sim.wfsR() );
         ff.write( m_cfg.prefix + "sciR.fits", sim.sciR() );
+
+        if( m_nModes > 0 )
+        {
+            ff.write( m_cfg.prefix + "modevalR.fits", sim.modevalR() );
+        }
+
+        if( m_cfg.sciQuadGain > 0 )
+        {
+            ff.write( m_cfg.prefix + "sciHr.fits", sim.sciHr() );
+            ff.write( m_cfg.prefix + "sciHi.fits", sim.sciHi() );
+        }
         ff.write( m_cfg.prefix + "pokes.fits",
                   xlinqCal::xlinqSim::randomPokes( m_cfg.dmRows, m_cfg.dmCols, m_nPokes, m_cfg.seed + 10 ) );
 
         sim.start();
 
         std::cout << "simulating " << m_cfg.dmChannel << ", " << m_cfg.dmComb << ", " << m_cfg.wfsName << ", "
-                  << m_cfg.sciName << "; ctrl-c to stop\n";
+                  << m_cfg.sciName << ( m_nModes > 0 ? ", " + m_cfg.modevalName : std::string() )
+                  << "; ctrl-c to stop\n";
 
         while( !g_stop )
         {

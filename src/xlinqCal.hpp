@@ -7,13 +7,14 @@
 #ifndef xlinqCal_hpp
 #define xlinqCal_hpp
 
-#include <array>
+#include <limits>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -26,20 +27,26 @@
 #include <mx/ioutils/fits/fitsFile.hpp>
 
 #include "isioStream.hpp"
+#include "wfsChannel.hpp"
 
 #ifndef XLINQCAL_GIT_VERSION
     #define XLINQCAL_GIT_VERSION "unknown"
 #endif
 
 /** \defgroup xlinqCal xlinqCal
- * \brief Standalone MagAO-X calibration of synchronized camwfs and camsci1 poke responses.
+ * \brief Standalone MagAO-X calibration of synchronized WFS and camsci1 poke responses.
  *
  * The DM is poked by writing `amp * shape` to a DM channel (default `dm01disp04`), and the
  * camwfs and camsci1 frames taken while the poke is on the DM are averaged. Frames are
  * synchronized to camsci1: after a poke, the first camsci1 frame and `sci.nSettle` more are
  * discarded, then camwfs frames are averaged between the posts that bound `sci.nFrames` averaged
  * camsci1 frames. The response for each camera is `(mean(+) - mean(-))/2`, averaged over
- * `seq.nRepeat` repeats with alternating sign order (`+-`, `-+`, ...).
+ * `seq.nRepeat` repeats with alternating sign order (`+-`, `-+`, ...). The symmetric mean
+ * `(mean(+) + mean(-))/2` is also saved. Zero-poke reference acquisitions are interleaved every
+ * `ref.every` pokes, and the even part `mean - ref` is formed with the reference linearly
+ * interpolated to each poke's center time, which cancels linear drift. Several WFS streams can be
+ * gated together (`wfs.shmim`), e.g. calibrated frames `aol1_imWFS2pub` and the loop's modal
+ * coefficients `aol1_modevalWFSpub`.
  */
 
 /** \defgroup xlinqCal_files xlinqCal Files
@@ -54,28 +61,44 @@ namespace timingCol
 {
 enum : int
 {
-    poke,         ///< Poke index in the input cube.
-    repeat,       ///< Repeat index.
-    sign,         ///< Poke sign, +1 or -1.
+    poke,         ///< Poke index in the input cube, NaN for a reference.
+    repeat,       ///< Repeat index, or the reference index for a reference.
+    sign,         ///< Poke sign, +1 or -1, or 0 for a reference.
     dmCnt0,       ///< cnt0 of the combined DM stream when the poke was confirmed, NaN if no DM write.
     dmProj,       ///< Projection of the combined DM change onto the commanded change, NaN if no DM write.
     sciCnt0First, ///< cnt0 of the first averaged camsci1 frame.
     sciCnt0Last,  ///< cnt0 of the last averaged camsci1 frame.
     sciN,         ///< Number of camsci1 frames averaged.
     sciMissed,    ///< camsci1 frames skipped (cnt0 gaps) during averaging.
-    wfsCnt0First, ///< cnt0 of the first averaged camwfs frame.
-    wfsCnt0Last,  ///< cnt0 of the last averaged camwfs frame.
-    wfsN,         ///< Number of camwfs frames averaged.
-    wfsMissed,    ///< camwfs frames skipped (cnt0 gaps) while the gate was open.
-    wfsTorn,      ///< camwfs frames dropped because they changed during the copy.
     tStart,       ///< Gate open time, Unix seconds.
     tEnd,         ///< Gate close time, Unix seconds.
-    nCols         ///< The number of columns.
+    nCommon       ///< The number of common columns; per-WFS-stream columns follow.
 };
 } // namespace timingCol
 
-/// One row of the timing table.
-typedef std::array<double, timingCol::nCols> timingRecord;
+/// Per-WFS-stream column offsets in the timing table, after the common columns.
+namespace wfsCol
+{
+enum : int
+{
+    cnt0First, ///< cnt0 of the first averaged frame.
+    cnt0Last,  ///< cnt0 of the last averaged frame.
+    n,         ///< Number of frames averaged.
+    missed,    ///< Frames skipped (cnt0 gaps) while the gate was open.
+    torn,      ///< Frames dropped because they changed during the copy.
+    nCols      ///< The number of columns per WFS stream.
+};
+} // namespace wfsCol
+
+/// Get the timing table column index of a field for WFS stream j.
+inline size_t wfsColIndex( size_t j, /**< [in] the WFS stream index */
+                           int    field /**< [in] the wfsCol field */ )
+{
+    return timingCol::nCommon + j * wfsCol::nCols + field;
+}
+
+/// One row of the timing table: timingCol::nCommon columns, then wfsCol::nCols per WFS stream.
+typedef std::vector<double> timingRecord;
 
 /// The xlinqCal application.
 /** Standalone (no INDI). Streams are opened with ImageStreamIO. The operator is responsible for
@@ -112,9 +135,11 @@ class xlinqCal : public mx::app::application
 
     double m_sciWait{ 5.0 }; ///< Timeout in seconds for each camsci1 frame.
 
-    std::string m_wfsName{ "camwfs" }; ///< The WFS camera stream, averaged over the camsci1 windows.
+    std::vector<std::string> m_wfsNames{ "camwfs" }; ///< The WFS streams, averaged over the camsci1 windows.
 
     unsigned m_nRepeat{ 2 }; ///< Number of +/- pairs per poke, with alternating order.
+
+    unsigned m_refEvery{ 1 }; ///< Pokes between zero-poke reference acquisitions, 0 disables references.
 
     std::string m_outDir{ "." }; ///< Output directory, created if needed.
 
@@ -134,7 +159,7 @@ class xlinqCal : public mx::app::application
 
     isioStream m_sci; ///< The camsci1 stream, with claimed semaphore.
 
-    isioStream m_wfs; ///< The camwfs stream, with claimed semaphore, read by the WFS thread.
+    std::vector<std::unique_ptr<wfsChannel>> m_wfs; ///< The WFS streams, each with its own reader thread.
 
     isioStream m_comb; ///< The combined DM stream, with claimed semaphore.
 
@@ -148,17 +173,21 @@ class xlinqCal : public mx::app::application
 
     mx::improc::eigenCube<float> m_pokes; ///< The poke shapes, normalized to 1 micron rms.
 
-    mx::improc::eigenCube<float> m_sciResp; ///< The camsci1 response cube, one plane per measured poke.
+    camProducts m_sciProd; ///< The camsci1 per-poke products (the WFS products are in each wfsChannel).
 
-    mx::improc::eigenCube<float> m_wfsResp; ///< The camwfs response cube, one plane per measured poke.
+    std::vector<double> m_pokeTime; ///< Center time of each completed poke, Unix seconds.
+
+    std::vector<double> m_refTime; ///< Center time of each reference, Unix seconds.
+
+    int m_nRef{ 0 }; ///< Number of completed references.
+
+    bool m_firstAcq{ true }; ///< True until the first acquisition, which always settles to align the gate.
 
     int m_nDone{ 0 }; ///< Number of completed response planes.
 
     std::vector<timingRecord> m_timing; ///< One timing row per acquisition.
 
     double m_sciFps{ 0 }; ///< camsci1 frame rate measured during preflight.
-
-    double m_wfsFps{ 0 }; ///< camwfs frame rate measured during preflight.
 
     uint64_t m_sciLastCnt0{ 0 }; ///< cnt0 of the last camsci1 frame received.
 
@@ -167,39 +196,6 @@ class xlinqCal : public mx::app::application
     std::string m_dateEnd; ///< UTC end of measurement, ISO 8601.
 
     std::ofstream m_logFile; ///< Run log, opened in the output directory.
-
-    ///@}
-
-    /** \name WFS Thread - Data
-     * State shared between the main thread and the WFS thread is protected by m_wfsMutex.
-     * @{
-     */
-
-    std::thread m_wfsThread; ///< The thread that reads and accumulates camwfs frames.
-
-    std::atomic<bool> m_wfsRun{ false }; ///< True while the WFS thread should run.
-
-    std::mutex m_wfsMutex; ///< Protects the gate and accumulators below.
-
-    bool m_wfsGate{ false }; ///< When true, camwfs frames are accumulated.
-
-    bool m_wfsGateFirst{ false }; ///< True until the first frame after the gate opens, for gap counting.
-
-    mx::improc::eigenImage<double> m_wfsSum; ///< Sum of camwfs frames while the gate is open.
-
-    uint64_t m_wfsN{ 0 }; ///< Number of frames in m_wfsSum.
-
-    uint64_t m_wfsMissed{ 0 }; ///< cnt0 gaps while the gate is open.
-
-    uint64_t m_wfsTorn{ 0 }; ///< Frames dropped as torn while the gate is open.
-
-    uint64_t m_wfsCnt0First{ 0 }; ///< cnt0 of the first accumulated frame.
-
-    uint64_t m_wfsCnt0Last{ 0 }; ///< cnt0 of the last accumulated frame.
-
-    uint64_t m_wfsLastSeen{ 0 }; ///< cnt0 of the last frame seen by the WFS thread.
-
-    std::atomic<int> m_wfsErrno{ 0 }; ///< Nonzero if the WFS thread exited on an error.
 
     ///@}
 
@@ -239,11 +235,30 @@ class xlinqCal : public mx::app::application
     /// Get the timing table.
     const std::vector<timingRecord> &timing() const;
 
-    /// Get the camsci1 response cube.
-    const mx::improc::eigenCube<float> &sciResp() const;
+    /// Get the camsci1 per-poke products.
+    const camProducts &sciProducts() const;
 
-    /// Get the camwfs response cube.
-    const mx::improc::eigenCube<float> &wfsResp() const;
+    /// Get the number of WFS streams.
+    size_t nWfs() const;
+
+    /// Get the per-poke products of WFS stream j.
+    const camProducts &wfsProducts( size_t j /**< [in] the WFS stream index */ ) const;
+
+    /// Get the number of completed references.
+    int nRef() const;
+
+    /// Find the references bracketing a time, and the linear interpolation weight.
+    /** The interpolated reference is `(1-w1)*ref[i0] + w1*ref[i1]`. If t is not bracketed, the
+     * nearest reference is used (i0 == i1, w1 = 0).
+     *
+     * \returns true if t is bracketed by two references
+     * \returns false if the nearest reference is used, or if tRef is empty (i0 = i1 = 0)
+     */
+    static bool refWeights( const std::vector<double> &tRef, /**< [in] reference times, increasing */
+                            double                     t,    /**< [in] the time to interpolate to */
+                            size_t                    &i0,   /**< [out] index of the earlier reference */
+                            size_t                    &i1,   /**< [out] index of the later reference */
+                            double                    &w1 /**< [out] the weight of ref[i1] */ );
 
   protected:
     /// Set up the configuration targets.
@@ -285,14 +300,14 @@ class xlinqCal : public mx::app::application
      */
     int setupOutput();
 
-    /// The WFS thread entry point.
-    void wfsThreadExec();
-
-    /// Start the WFS thread.
+    /// Start the WFS reader threads.
     void startWfsThread();
 
-    /// Stop and join the WFS thread.
+    /// Stop and join the WFS reader threads.
     void stopWfsThread();
+
+    /// Make a timing row of NaNs, sized for the WFS streams.
+    timingRecord newRecord() const;
 
     /// Measure all pokes, with checkpoints.
     /** \returns 0 on success, 1 if stopped, -1 on error
@@ -303,6 +318,37 @@ class xlinqCal : public mx::app::application
     /** \returns 0 on success, 1 if stopped, -1 on error
      */
     int measurePoke( int k /**< [in] the poke index in m_pokes */ );
+
+    /// Measure a zero-poke reference and store it.
+    /** \returns 0 on success, 1 if stopped, -1 on error
+     */
+    int measureRef();
+
+    /// Set the DM command if it changed, then acquire synchronized means.
+    /** Settles if the command changed, or on the first acquisition.
+     *
+     * \returns 0 on success, 1 if stopped, -1 on error
+     */
+    int setAndAcquire( const mx::improc::eigenImage<float>         &cmd,      /**< [in] the full channel command */
+                       mx::improc::eigenImage<double>              &sciMean,  /**< [out] the camsci1 mean */
+                       std::vector<mx::improc::eigenImage<double>> &wfsMeans, /**< [out] the WFS means */
+                       timingRecord                                &rec /**< [in.out] timing fields are set */ );
+
+    /// Form the even part `mean - ref` for completed pokes, with references interpolated in time.
+    /** \returns the number of planes that used a one-sided (nearest) reference
+     */
+    int evenCube( mx::improc::eigenCube<float>       &even, /**< [out] the even part, m_nDone planes */
+                  const mx::improc::eigenCube<float> &mean, /**< [in] the symmetric means */
+                  const mx::improc::eigenCube<float> &ref /**< [in] the references */ ) const;
+
+    /// Write the first nPlanes planes of a cube with the common header and a product description.
+    /** \returns 0 on success, -1 on error
+     */
+    int writeCube( const std::string                  &suffix,  /**< [in] appended to the output prefix */
+                   const mx::improc::eigenCube<float> &cube,    /**< [in] the cube */
+                   int                                 nPlanes, /**< [in] the number of planes to write */
+                   mx::fits::fitsHeader<>              head,    /**< [in] the common header (copied) */
+                   const std::string                  &product /**< [in] the PRODUCT keyword value */ );
 
     /// Write a DM command and wait for the combined DM stream to update.
     /** \returns 0 on success, 1 if stopped, -1 on error
@@ -316,13 +362,13 @@ class xlinqCal : public mx::app::application
     int waitSciFrame( mx::improc::eigenImage<double> *frame, /**< [out] the frame, or nullptr to only wait */
                       uint64_t                       &cnt0 /**< [out] the frame counter */ );
 
-    /// Acquire synchronized camsci1 and camwfs means for the current DM state.
+    /// Acquire synchronized camsci1 and WFS means for the current DM state.
     /** \returns 0 on success, 1 if stopped, -1 on error
      */
-    int acquire( bool                            settle,  /**< [in] discard settle frames first */
-                 mx::improc::eigenImage<double> &sciMean, /**< [out] the camsci1 mean */
-                 mx::improc::eigenImage<double> &wfsMean, /**< [out] the camwfs mean */
-                 timingRecord                   &rec /**< [in.out] camera fields are set */ );
+    int acquire( bool                                         settle,   /**< [in] discard settle frames first */
+                 mx::improc::eigenImage<double>              &sciMean,  /**< [out] the camsci1 mean */
+                 std::vector<mx::improc::eigenImage<double>> &wfsMeans, /**< [out] the WFS means */
+                 timingRecord                                &rec /**< [in.out] camera fields are set */ );
 
     /// Restore the DM channel to its initial content.
     void restoreDm();
@@ -428,14 +474,51 @@ inline const std::vector<timingRecord> &xlinqCal::timing() const
     return m_timing;
 }
 
-inline const mx::improc::eigenCube<float> &xlinqCal::sciResp() const
+inline const camProducts &xlinqCal::sciProducts() const
 {
-    return m_sciResp;
+    return m_sciProd;
 }
 
-inline const mx::improc::eigenCube<float> &xlinqCal::wfsResp() const
+inline size_t xlinqCal::nWfs() const
 {
-    return m_wfsResp;
+    return m_wfs.size();
+}
+
+inline const camProducts &xlinqCal::wfsProducts( size_t j ) const
+{
+    return m_wfs[j]->products();
+}
+
+inline int xlinqCal::nRef() const
+{
+    return m_nRef;
+}
+
+inline bool xlinqCal::refWeights( const std::vector<double> &tRef, double t, size_t &i0, size_t &i1, double &w1 )
+{
+    i0 = 0;
+    i1 = 0;
+    w1 = 0;
+
+    if( tRef.empty() )
+    {
+        return false;
+    }
+
+    size_t j = std::upper_bound( tRef.begin(), tRef.end(), t ) - tRef.begin();
+
+    if( j == 0 || j == tRef.size() )
+    {
+        i0 = ( j == 0 ) ? 0 : tRef.size() - 1;
+        i1 = i0;
+        return false;
+    }
+
+    i0 = j - 1;
+    i1 = j;
+    w1 = ( t - tRef[i0] ) / ( tRef[i1] - tRef[i0] );
+
+    return true;
 }
 
 inline void xlinqCal::setupConfig()
@@ -562,8 +645,8 @@ inline void xlinqCal::setupConfig()
                 "wfs",
                 "shmim",
                 false,
-                "string",
-                "The WFS camera stream. Default camwfs." );
+                "vector<string>",
+                "The WFS streams, comma separated, e.g. aol1_imWFS2pub,aol1_modevalWFSpub. Default camwfs." );
 
     config.add( "seq.nRepeat",
                 "",
@@ -574,6 +657,17 @@ inline void xlinqCal::setupConfig()
                 false,
                 "int",
                 "Number of +/- pairs per poke, alternating +- and -+. Default 2." );
+
+    config.add( "ref.every",
+                "",
+                "ref.every",
+                argType::Required,
+                "ref",
+                "every",
+                false,
+                "int",
+                "Pokes between zero-poke reference acquisitions, 0 disables references and the even part. "
+                "Default 1." );
 
     config.add( "out.dir",
                 "",
@@ -633,9 +727,11 @@ inline void xlinqCal::loadConfig()
     config( m_sciFrames, "sci.nFrames" );
     config( m_sciWait, "sci.wait" );
 
-    config( m_wfsName, "wfs.shmim" );
+    config( m_wfsNames, "wfs.shmim" );
 
     config( m_nRepeat, "seq.nRepeat" );
+
+    config( m_refEvery, "ref.every" );
 
     config( m_outDir, "out.dir" );
     config( m_outPrefix, "out.prefix" );
@@ -809,11 +905,23 @@ inline int xlinqCal::openStreams()
         log( "warning: " + m_dmChannel + " is not zero at startup; pokes are added to it and it will be restored" );
     }
 
+    if( m_wfsNames.empty() )
+    {
+        logError( "wfs.shmim must name at least one stream" );
+        return -1;
+    }
+
     try
     {
         m_comb.open( m_dmComb );
         m_sci.open( m_sciName );
-        m_wfs.open( m_wfsName );
+
+        m_wfs.clear();
+        for( const std::string &name : m_wfsNames )
+        {
+            m_wfs.push_back( std::make_unique<wfsChannel>() );
+            m_wfs.back()->open( name );
+        }
     }
     catch( const std::exception &e )
     {
@@ -827,25 +935,35 @@ inline int xlinqCal::openStreams()
         return -1;
     }
 
-    m_sciResp.resize( m_sci.rows(), m_sci.cols(), m_pokeLast - m_pokeFirst + 1 );
-    m_wfsResp.resize( m_wfs.rows(), m_wfs.cols(), m_pokeLast - m_pokeFirst + 1 );
-    m_sciResp.setZero();
-    m_wfsResp.setZero();
+    int nPoke = m_pokeLast - m_pokeFirst + 1;
+    int nRef  = ( m_refEvery > 0 ) ? ( nPoke + m_refEvery - 1 ) / m_refEvery + 1 : 0;
+
+    m_sciProd.allocate( m_sci.rows(), m_sci.cols(), nPoke, nRef );
+
+    for( auto &w : m_wfs )
+    {
+        w->products().allocate( w->stream().rows(), w->stream().cols(), nPoke, nRef );
+    }
 
     return 0;
 }
 
 inline int xlinqCal::preflight()
 {
-    uint64_t sci0 = m_sci.cnt0();
-    uint64_t wfs0 = m_wfs.cnt0();
-    double   t0   = nowSec();
+    uint64_t              sci0 = m_sci.cnt0();
+    std::vector<uint64_t> wfs0;
+
+    for( auto &w : m_wfs )
+    {
+        wfs0.push_back( w->stream().cnt0() );
+    }
+
+    double t0 = nowSec();
 
     std::this_thread::sleep_for( std::chrono::duration<double>( m_preflightTime ) );
 
     double dt = nowSec() - t0;
     m_sciFps  = ( m_sci.cnt0() - sci0 ) / dt;
-    m_wfsFps  = ( m_wfs.cnt0() - wfs0 ) / dt;
 
     if( m_sciFps <= 0 )
     {
@@ -853,17 +971,29 @@ inline int xlinqCal::preflight()
         return -1;
     }
 
-    if( m_wfsFps <= 0 )
+    double wfsPix = 0;
+
+    for( size_t j = 0; j < m_wfs.size(); ++j )
     {
-        logError( m_wfsName + " is not updating" );
-        return -1;
+        m_wfs[j]->fps( ( m_wfs[j]->stream().cnt0() - wfs0[j] ) / dt );
+
+        if( m_wfs[j]->fps() <= 0 )
+        {
+            logError( m_wfsNames[j] + " is not updating" );
+            return -1;
+        }
+
+        wfsPix += m_wfs[j]->stream().rows() * m_wfs[j]->stream().cols();
     }
 
     std::vector<int> signs         = signSequence( m_nRepeat );
     int              nPoke         = m_pokeLast - m_pokeFirst + 1;
     double           framesPerPoke = settleCount( signs ) * ( 1.0 + m_sciSettle ) + signs.size() * m_sciFrames;
-    double           hours         = nPoke * framesPerPoke / m_sciFps / 3600.;
-    double           gbytes        = nPoke * 4.0 * ( m_sci.rows() * m_sci.cols() + m_wfs.rows() * m_wfs.cols() ) / 1e9;
+    int              nRef          = ( m_refEvery > 0 ) ? ( nPoke + m_refEvery - 1 ) / m_refEvery + 1 : 0;
+    double           frames        = nPoke * framesPerPoke + nRef * ( 1.0 + m_sciSettle + m_sciFrames );
+    double           hours         = frames / m_sciFps / 3600.;
+    double           planes        = ( m_refEvery > 0 ) ? 3.0 * nPoke + nRef : 2.0 * nPoke; // resp, mean, [even, ref]
+    double           gbytes        = planes * 4.0 * ( m_sci.rows() * m_sci.cols() + wfsPix ) / 1e9;
     std::string      seq;
 
     for( int s : signs )
@@ -879,10 +1009,15 @@ inline int xlinqCal::preflight()
        << m_pokeAmp << " um rms\n";
     os << "  sci:     " << m_sciName << " " << m_sci.rows() << "x" << m_sci.cols() << " type " << (int)m_sci.datatype()
        << " at " << m_sciFps << " fps\n";
-    os << "  wfs:     " << m_wfsName << " " << m_wfs.rows() << "x" << m_wfs.cols() << " type " << (int)m_wfs.datatype()
-       << " at " << m_wfsFps << " fps (~" << m_wfsFps / m_sciFps << " per sci frame)\n";
+    for( size_t j = 0; j < m_wfs.size(); ++j )
+    {
+        const isioStream &ws = m_wfs[j]->stream();
+        os << "  wfs " << j << ":   " << m_wfsNames[j] << " " << ws.rows() << "x" << ws.cols() << " type "
+           << (int)ws.datatype() << " at " << m_wfs[j]->fps() << " fps (~" << m_wfs[j]->fps() / m_sciFps
+           << " per sci frame)\n";
+    }
     os << "  timing:  discard 1+" << m_sciSettle << ", average " << m_sciFrames << " sci frames, sequence " << seq
-       << "\n";
+       << ", reference every " << m_refEvery << " pokes (" << nRef << " total)\n";
     os << "  estimate: " << hours << " h, " << gbytes << " GB output";
     log( os.str() );
 
@@ -942,86 +1077,25 @@ inline int xlinqCal::setupOutput()
     return 0;
 }
 
-inline void xlinqCal::wfsThreadExec()
-{
-    mx::improc::eigenImage<double> frame;
-
-    while( m_wfsRun )
-    {
-        waitResult wr = m_wfs.wait( 0.5 );
-
-        if( wr == waitResult::timeout )
-        {
-            continue;
-        }
-
-        if( wr == waitResult::error )
-        {
-            m_wfsErrno = errno ? errno : -1;
-            return;
-        }
-
-        uint64_t cnt0;
-        bool     ok = m_wfs.copy( frame, cnt0 );
-
-        if( cnt0 == m_wfsLastSeen )
-        {
-            continue; // A repeated post for a frame already seen
-        }
-
-        { //mutex scope
-            std::lock_guard<std::mutex> lock( m_wfsMutex );
-
-            if( m_wfsGate )
-            {
-                if( !m_wfsGateFirst && cnt0 > m_wfsLastSeen + 1 )
-                {
-                    m_wfsMissed += cnt0 - m_wfsLastSeen - 1;
-                }
-
-                m_wfsGateFirst = false;
-
-                if( ok )
-                {
-                    if( m_wfsN == 0 )
-                    {
-                        m_wfsCnt0First = cnt0;
-                    }
-
-                    m_wfsSum += frame;
-                    m_wfsCnt0Last = cnt0;
-                    ++m_wfsN;
-                }
-                else
-                {
-                    ++m_wfsTorn;
-                }
-            }
-        }
-
-        m_wfsLastSeen = cnt0;
-    }
-}
-
 inline void xlinqCal::startWfsThread()
 {
-    m_wfsSum.resize( m_wfs.rows(), m_wfs.cols() );
-    m_wfsSum.setZero();
-    m_wfsGate     = false;
-    m_wfsErrno    = 0;
-    m_wfsLastSeen = m_wfs.cnt0();
-    m_wfsRun      = true;
-    m_wfsThread   = std::thread( &xlinqCal::wfsThreadExec, this );
+    for( auto &w : m_wfs )
+    {
+        w->start();
+    }
 }
 
 inline void xlinqCal::stopWfsThread()
 {
-    m_wfsRun = false;
-
-    if( m_wfsThread.joinable() )
+    for( auto &w : m_wfs )
     {
-        m_wfsThread.join();
+        w->stop();
     }
+}
+
+inline timingRecord xlinqCal::newRecord() const
+{
+    return timingRecord( timingCol::nCommon + m_wfs.size() * wfsCol::nCols, std::numeric_limits<double>::quiet_NaN() );
 }
 
 inline int xlinqCal::run()
@@ -1029,8 +1103,14 @@ inline int xlinqCal::run()
     int    nPoke    = m_pokeLast - m_pokeFirst + 1;
     double tStart   = nowSec();
     double tLastChk = tStart;
+    int    rv;
 
     m_sciLastCnt0 = m_sci.cnt0();
+
+    if( m_refEvery > 0 && ( rv = measureRef() ) != 0 )
+    {
+        return rv;
+    }
 
     for( int k = m_pokeFirst; k <= m_pokeLast; ++k )
     {
@@ -1039,22 +1119,26 @@ inline int xlinqCal::run()
             return 1;
         }
 
-        int rv = measurePoke( k );
-
-        if( rv != 0 )
+        if( ( rv = measurePoke( k ) ) != 0 )
         {
             return rv;
         }
 
         ++m_nDone;
 
+        if( m_refEvery > 0 && ( m_nDone % m_refEvery == 0 || k == m_pokeLast ) && ( rv = measureRef() ) != 0 )
+        {
+            return rv;
+        }
+
         const timingRecord &last    = m_timing.back();
         double              elapsed = nowSec() - tStart;
         double              eta     = elapsed / m_nDone * ( nPoke - m_nDone );
 
         std::ostringstream os;
-        os << "poke " << k << " (" << m_nDone << "/" << nPoke << ") wfs frames/window " << last[timingCol::wfsN]
-           << ", elapsed " << elapsed / 60 << " min, remaining " << eta / 60 << " min";
+        os << "poke " << k << " (" << m_nDone << "/" << nPoke << ") wfs frames/window "
+           << last[wfsColIndex( 0, wfsCol::n )] << ", elapsed " << elapsed / 60 << " min, remaining " << eta / 60
+           << " min";
         log( os.str() );
 
         if( m_checkpointMin > 0 && nowSec() - tLastChk > m_checkpointMin * 60 && m_nDone < nPoke )
@@ -1070,52 +1154,115 @@ inline int xlinqCal::run()
 inline int xlinqCal::measurePoke( int k )
 {
     std::vector<int> signs = signSequence( m_nRepeat );
+    size_t           nW    = m_wfs.size();
 
-    mx::improc::eigenImage<double> sciMean, wfsMean;
-    mx::improc::eigenImage<double> sciAcc( m_sci.rows(), m_sci.cols() );
-    mx::improc::eigenImage<double> wfsAcc( m_wfs.rows(), m_wfs.cols() );
-    sciAcc.setZero();
-    wfsAcc.setZero();
+    mx::improc::eigenImage<double>              sciMean;
+    std::vector<mx::improc::eigenImage<double>> wfsMeans( nW );
+
+    // Signed and symmetric accumulators: index 0 is camsci1, 1..nW are the WFS streams
+    std::vector<mx::improc::eigenImage<double>> odd( nW + 1 ), sym( nW + 1 );
+
+    for( size_t j = 0; j <= nW; ++j )
+    {
+        const isioStream &st = ( j == 0 ) ? m_sci : m_wfs[j - 1]->stream();
+        odd[j].setZero( st.rows(), st.cols() );
+        sym[j].setZero( st.rows(), st.cols() );
+    }
+
+    double tCenter = 0;
 
     for( size_t i = 0; i < signs.size(); ++i )
     {
-        timingRecord rec;
-        rec.fill( std::numeric_limits<double>::quiet_NaN() );
+        timingRecord rec       = newRecord();
         rec[timingCol::poke]   = k;
         rec[timingCol::repeat] = i / 2;
         rec[timingCol::sign]   = signs[i];
 
         mx::improc::eigenImage<float> cmd = m_dmInitial + ( signs[i] * m_pokeAmp ) * m_pokes.image( k );
 
-        bool settle = !( cmd == m_dmLast ).all();
-
-        if( settle )
-        {
-            int rv = applyCommand( cmd, rec );
-            if( rv != 0 )
-            {
-                return rv;
-            }
-        }
-
-        int rv = acquire( settle, sciMean, wfsMean, rec );
+        int rv = setAndAcquire( cmd, sciMean, wfsMeans, rec );
         if( rv != 0 )
         {
             return rv;
         }
 
-        sciAcc += static_cast<double>( signs[i] ) * sciMean;
-        wfsAcc += static_cast<double>( signs[i] ) * wfsMean;
+        for( size_t j = 0; j <= nW; ++j )
+        {
+            const mx::improc::eigenImage<double> &mean = ( j == 0 ) ? sciMean : wfsMeans[j - 1];
+            odd[j] += static_cast<double>( signs[i] ) * mean;
+            sym[j] += mean;
+        }
+
+        tCenter += 0.5 * ( rec[timingCol::tStart] + rec[timingCol::tEnd] );
 
         m_timing.push_back( rec );
     }
 
-    // (mean(+) - mean(-))/2, averaged over repeats
-    double nAcq                        = signs.size();
-    m_sciResp.image( k - m_pokeFirst ) = ( sciAcc / nAcq ).cast<float>();
-    m_wfsResp.image( k - m_pokeFirst ) = ( wfsAcc / nAcq ).cast<float>();
+    // (mean(+) - mean(-))/2 and (mean(+) + mean(-))/2, averaged over repeats
+    double nAcq = signs.size();
+
+    for( size_t j = 0; j <= nW; ++j )
+    {
+        camProducts &prod                  = ( j == 0 ) ? m_sciProd : m_wfs[j - 1]->products();
+        prod.resp.image( k - m_pokeFirst ) = ( odd[j] / nAcq ).cast<float>();
+        prod.mean.image( k - m_pokeFirst ) = ( sym[j] / nAcq ).cast<float>();
+    }
+
+    m_pokeTime.push_back( tCenter / nAcq );
 
     return 0;
+}
+
+inline int xlinqCal::measureRef()
+{
+    timingRecord rec       = newRecord();
+    rec[timingCol::repeat] = m_nRef;
+    rec[timingCol::sign]   = 0;
+
+    mx::improc::eigenImage<double>              sciMean;
+    std::vector<mx::improc::eigenImage<double>> wfsMeans( m_wfs.size() );
+
+    int rv = setAndAcquire( m_dmInitial, sciMean, wfsMeans, rec );
+    if( rv != 0 )
+    {
+        return rv;
+    }
+
+    m_sciProd.ref.image( m_nRef ) = sciMean.cast<float>();
+
+    for( size_t j = 0; j < m_wfs.size(); ++j )
+    {
+        m_wfs[j]->products().ref.image( m_nRef ) = wfsMeans[j].cast<float>();
+    }
+
+    m_refTime.push_back( 0.5 * ( rec[timingCol::tStart] + rec[timingCol::tEnd] ) );
+    ++m_nRef;
+
+    m_timing.push_back( rec );
+
+    return 0;
+}
+
+inline int xlinqCal::setAndAcquire( const mx::improc::eigenImage<float>         &cmd,
+                                    mx::improc::eigenImage<double>              &sciMean,
+                                    std::vector<mx::improc::eigenImage<double>> &wfsMeans,
+                                    timingRecord                                &rec )
+{
+    bool changed = !( cmd == m_dmLast ).all();
+
+    if( changed )
+    {
+        int rv = applyCommand( cmd, rec );
+        if( rv != 0 )
+        {
+            return rv;
+        }
+    }
+
+    bool settle = changed || m_firstAcq;
+    m_firstAcq  = false;
+
+    return acquire( settle, sciMean, wfsMeans, rec );
 }
 
 inline int xlinqCal::applyCommand( const mx::improc::eigenImage<float> &cmd, timingRecord &rec )
@@ -1180,10 +1327,13 @@ inline int xlinqCal::waitSciFrame( mx::improc::eigenImage<double> *frame, uint64
             return 1;
         }
 
-        if( m_wfsErrno != 0 )
+        for( size_t j = 0; j < m_wfs.size(); ++j )
         {
-            logError( "WFS thread error waiting on " + m_wfsName );
-            return -1;
+            if( m_wfs[j]->error() != 0 )
+            {
+                logError( "WFS thread error waiting on " + m_wfsNames[j] );
+                return -1;
+            }
         }
 
         if( nowSec() > tWait )
@@ -1220,10 +1370,10 @@ inline int xlinqCal::waitSciFrame( mx::improc::eigenImage<double> *frame, uint64
     }
 }
 
-inline int xlinqCal::acquire( bool                            settle,
-                              mx::improc::eigenImage<double> &sciMean,
-                              mx::improc::eigenImage<double> &wfsMean,
-                              timingRecord                   &rec )
+inline int xlinqCal::acquire( bool                                         settle,
+                              mx::improc::eigenImage<double>              &sciMean,
+                              std::vector<mx::improc::eigenImage<double>> &wfsMeans,
+                              timingRecord                                &rec )
 {
     uint64_t cnt0;
     int      rv;
@@ -1243,15 +1393,10 @@ inline int xlinqCal::acquire( bool                            settle,
         }
     }
 
-    // Open the gate: the next camsci1 exposure starts now.
-    { //mutex scope
-        std::lock_guard<std::mutex> lock( m_wfsMutex );
-        m_wfsSum.setZero();
-        m_wfsN         = 0;
-        m_wfsMissed    = 0;
-        m_wfsTorn      = 0;
-        m_wfsGateFirst = true;
-        m_wfsGate      = true;
+    // Open the gates: the next camsci1 exposure starts now.
+    for( auto &w : m_wfs )
+    {
+        w->openGate();
     }
 
     rec[timingCol::tStart] = nowSec();
@@ -1267,8 +1412,12 @@ inline int xlinqCal::acquire( bool                            settle,
     {
         if( ( rv = waitSciFrame( &frame, cnt0 ) ) != 0 )
         {
-            std::lock_guard<std::mutex> lock( m_wfsMutex );
-            m_wfsGate = false;
+            wfsGateStats st;
+            for( size_t j = 0; j < m_wfs.size(); ++j )
+            {
+                m_wfs[j]->closeGate( wfsMeans[j], st );
+            }
+
             return rv;
         }
 
@@ -1285,20 +1434,23 @@ inline int xlinqCal::acquire( bool                            settle,
         sciSum += frame;
     }
 
-    { //mutex scope
-        std::lock_guard<std::mutex> lock( m_wfsMutex );
-        m_wfsGate = false;
+    bool allFrames = true;
 
-        rec[timingCol::wfsN]         = m_wfsN;
-        rec[timingCol::wfsMissed]    = m_wfsMissed;
-        rec[timingCol::wfsTorn]      = m_wfsTorn;
-        rec[timingCol::wfsCnt0First] = m_wfsCnt0First;
-        rec[timingCol::wfsCnt0Last]  = m_wfsCnt0Last;
+    for( size_t j = 0; j < m_wfs.size(); ++j )
+    {
+        wfsGateStats st;
 
-        if( m_wfsN > 0 )
+        if( !m_wfs[j]->closeGate( wfsMeans[j], st ) )
         {
-            wfsMean = m_wfsSum / static_cast<double>( m_wfsN );
+            logError( "no " + m_wfsNames[j] + " frames received during the averaging window" );
+            allFrames = false;
         }
+
+        rec[wfsColIndex( j, wfsCol::cnt0First )] = st.cnt0First;
+        rec[wfsColIndex( j, wfsCol::cnt0Last )]  = st.cnt0Last;
+        rec[wfsColIndex( j, wfsCol::n )]         = st.n;
+        rec[wfsColIndex( j, wfsCol::missed )]    = st.missed;
+        rec[wfsColIndex( j, wfsCol::torn )]      = st.torn;
     }
 
     rec[timingCol::tEnd]        = nowSec();
@@ -1306,9 +1458,8 @@ inline int xlinqCal::acquire( bool                            settle,
     rec[timingCol::sciN]        = m_sciFrames;
     rec[timingCol::sciMissed]   = sciMissed;
 
-    if( rec[timingCol::wfsN] == 0 )
+    if( !allFrames )
     {
-        logError( "no " + m_wfsName + " frames received during the averaging window" );
         return -1;
     }
 
@@ -1342,7 +1493,6 @@ inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
     mx::fits::fitsHeader<> head;
     head.append( "XLQVERS", std::string( XLINQCAL_GIT_VERSION ), "xlinqCal version" );
     head.append( "COMPLETE", final && m_nDone == m_pokeLast - m_pokeFirst + 1, "all requested pokes measured" );
-    head.append( "RESPDEF", std::string( "(mean(+)-mean(-))/2" ), "not divided by POKEAMP" );
     head.append( "POKEFILE", m_pokeFile, "poke shapes, 1 um rms each" );
     head.append( "POKEAMP", m_pokeAmp, "poke amplitude [um rms]" );
     head.append( "POKE0", m_pokeFirst, "poke index of first plane" );
@@ -1352,14 +1502,22 @@ inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
     head.append( "NFRAMES", m_sciFrames, "sci frames averaged per sign" );
     head.append( "NREPEAT", m_nRepeat, "+/- pairs per poke" );
     head.append( "SEQUENCE", seq, "sign sequence per poke" );
+    head.append( "REFEVERY", m_refEvery, "pokes between zero-poke references, 0 = none" );
+    head.append( "NREF", m_nRef, "number of references measured" );
     head.append( "DMCHAN", m_dmChannel, "DM channel poked" );
     head.append( "DMCOMB", m_dmComb, "combined DM stream" );
     head.append( "SCISTRM", m_sciName, "science camera stream" );
     head.append( "SCIFPS", m_sciFps, "measured sci frame rate [Hz]" );
     head.append( "SCITYPE", (int)m_sci.datatype(), "sci ImageStreamIO datatype" );
-    head.append( "WFSSTRM", m_wfsName, "WFS camera stream" );
-    head.append( "WFSFPS", m_wfsFps, "measured WFS frame rate [Hz]" );
-    head.append( "WFSTYPE", (int)m_wfs.datatype(), "WFS ImageStreamIO datatype" );
+    head.append( "NWFS", (int)m_wfs.size(), "number of WFS streams" );
+
+    for( size_t j = 0; j < m_wfs.size(); ++j )
+    {
+        std::string jj = std::to_string( j );
+        head.append( "WFS" + jj + "STRM", m_wfsNames[j], "WFS stream " + jj );
+        head.append( "WFS" + jj + "FPS", m_wfs[j]->fps(), "measured frame rate [Hz]" );
+        head.append( "WFS" + jj + "TYPE", (int)m_wfs[j]->stream().datatype(), "ImageStreamIO datatype" );
+    }
     head.append( "DATE-BEG", m_dateBeg, "UTC start of measurement" );
     head.append( "DATE-END", m_dateEnd.empty() ? std::string( "running" ) : m_dateEnd, "UTC end of measurement" );
 
@@ -1369,6 +1527,53 @@ inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
 inline std::string xlinqCal::outputPath( const std::string &suffix ) const
 {
     return ( std::filesystem::path( m_outDir ) / ( m_outPrefix + suffix ) ).string();
+}
+
+inline int xlinqCal::evenCube( mx::improc::eigenCube<float>       &even,
+                               const mx::improc::eigenCube<float> &mean,
+                               const mx::improc::eigenCube<float> &ref ) const
+{
+    even.resize( mean.rows(), mean.cols(), std::max( m_nDone, 1 ) );
+
+    std::vector<double> tRef( m_refTime.begin(), m_refTime.begin() + m_nRef );
+
+    int nOneSided = 0;
+
+    for( int k = 0; k < m_nDone; ++k )
+    {
+        size_t i0, i1;
+        double w1;
+
+        if( !refWeights( tRef, m_pokeTime[k], i0, i1, w1 ) )
+        {
+            ++nOneSided;
+        }
+
+        even.image( k ) = mean.image( k ) - ( ( 1 - w1 ) * ref.image( i0 ) + w1 * ref.image( i1 ) ).cast<float>();
+    }
+
+    return nOneSided;
+}
+
+inline int xlinqCal::writeCube( const std::string                  &suffix,
+                                const mx::improc::eigenCube<float> &cube,
+                                int                                 nPlanes,
+                                mx::fits::fitsHeader<>              head,
+                                const std::string                  &product )
+{
+    head.append( "PRODUCT", product, "content of this cube" );
+
+    std::string               file = outputPath( suffix );
+    mx::fits::fitsFile<float> ff;
+
+    // Planes are contiguous, so the first nPlanes planes are written directly.
+    if( ff.write( file, cube.data(), cube.rows(), cube.cols(), nPlanes, head ) != mx::error_t::noerror )
+    {
+        logError( "could not write " + file );
+        return -1;
+    }
+
+    return 0;
 }
 
 inline int xlinqCal::writeOutput( bool final )
@@ -1383,56 +1588,61 @@ inline int xlinqCal::writeOutput( bool final )
 
     mx::fits::fitsHeader<> head = outputHeader( final );
 
-    // Planes are contiguous, so the first m_nDone planes are written directly.
-    mx::fits::fitsFile<float> ff;
-    std::string               sciFile = outputPath( "_" + m_sciName + "_resp.fits" );
-
-    if( ff.write( sciFile, m_sciResp.data(), m_sciResp.rows(), m_sciResp.cols(), m_nDone, head ) !=
-        mx::error_t::noerror )
+    auto writeCam = [&]( const std::string &name, const camProducts &prod )
     {
-        logError( "could not write " + sciFile );
-        rv = -1;
+        const mx::improc::eigenCube<float> &resp = prod.resp;
+        const mx::improc::eigenCube<float> &mean = prod.mean;
+        const mx::improc::eigenCube<float> &ref  = prod.ref;
+
+        std::string pre = "_" + name;
+
+        rv |= writeCube( pre + "_resp.fits", resp, m_nDone, head, "(mean(+)-mean(-))/2, not divided by POKEAMP" );
+        rv |= writeCube( pre + "_mean.fits", mean, m_nDone, head, "(mean(+)+mean(-))/2" );
+
+        if( m_nRef > 0 )
+        {
+            mx::improc::eigenCube<float> even;
+            int                          nOneSided = evenCube( even, mean, ref );
+
+            mx::fits::fitsHeader<> evenHead = head;
+            evenHead.append( "EVEN1SID", nOneSided, "planes using a one-sided (nearest) reference" );
+
+            rv |= writeCube( pre + "_even.fits", even, m_nDone, evenHead, "mean - ref interpolated to poke time" );
+            rv |= writeCube( pre + "_ref.fits", ref, m_nRef, head, "zero-poke reference" );
+        }
+    };
+
+    writeCam( m_sciName, m_sciProd );
+
+    for( size_t j = 0; j < m_wfs.size(); ++j )
+    {
+        writeCam( m_wfsNames[j], m_wfs[j]->products() );
     }
 
-    std::string wfsFile = outputPath( "_" + m_wfsName + "_resp.fits" );
+    std::vector<std::string> colNames = {
+        "POKE", "REPEAT", "SIGN", "DMCNT0", "DMPROJ", "SCICNT0A", "SCICNT0B", "SCIN", "SCIMISS", "TSTART", "TEND" };
 
-    if( ff.write( wfsFile, m_wfsResp.data(), m_wfsResp.rows(), m_wfsResp.cols(), m_nDone, head ) !=
-        mx::error_t::noerror )
+    for( size_t j = 0; j < m_wfs.size(); ++j )
     {
-        logError( "could not write " + wfsFile );
-        rv = -1;
+        for( const char *f : { "CNT0A", "CNT0B", "N", "MISS", "TORN" } )
+        {
+            colNames.push_back( "W" + std::to_string( j ) + f );
+        }
     }
 
-    static const char *colNames[timingCol::nCols] = { "POKE",
-                                                      "REPEAT",
-                                                      "SIGN",
-                                                      "DMCNT0",
-                                                      "DMPROJ",
-                                                      "SCICNT0A",
-                                                      "SCICNT0B",
-                                                      "SCIN",
-                                                      "SCIMISS",
-                                                      "WFSCNT0A",
-                                                      "WFSCNT0B",
-                                                      "WFSN",
-                                                      "WFSMISS",
-                                                      "WFSTORN",
-                                                      "TSTART",
-                                                      "TEND" };
-
-    mx::improc::eigenImage<double> table( timingCol::nCols, m_timing.size() );
+    mx::improc::eigenImage<double> table( colNames.size(), m_timing.size() );
 
     for( size_t r = 0; r < m_timing.size(); ++r )
     {
-        for( int c = 0; c < timingCol::nCols; ++c )
+        for( size_t c = 0; c < colNames.size(); ++c )
         {
             table( c, r ) = m_timing[r][c];
         }
     }
 
-    for( int c = 0; c < timingCol::nCols; ++c )
+    for( size_t c = 0; c < colNames.size(); ++c )
     {
-        head.append( "TCOL" + std::to_string( c ), std::string( colNames[c] ), "timing table column" );
+        head.append( "TCOL" + std::to_string( c ), colNames[c], "timing table column" );
     }
 
     mx::fits::fitsFile<double> fd;

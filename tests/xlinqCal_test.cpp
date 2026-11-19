@@ -43,6 +43,38 @@ TEST_CASE( "settleCount counts DM changes", "[xlinqCal]" )
     REQUIRE( xlinqCal::settleCount( xlinqCal::signSequence( 3 ) ) == 4 );
 }
 
+/// Reference interpolation brackets a time when possible and falls back to the nearest reference.
+TEST_CASE( "refWeights interpolates between bracketing references", "[xlinqCal]" )
+{
+    using xlinqCal::xlinqCal;
+
+    size_t i0, i1;
+    double w1;
+
+    std::vector<double> t = { 10, 20, 40 };
+
+    REQUIRE( xlinqCal::refWeights( t, 15, i0, i1, w1 ) );
+    REQUIRE( i0 == 0 );
+    REQUIRE( i1 == 1 );
+    REQUIRE( w1 == Approx( 0.5 ) );
+
+    REQUIRE( xlinqCal::refWeights( t, 35, i0, i1, w1 ) );
+    REQUIRE( i0 == 1 );
+    REQUIRE( i1 == 2 );
+    REQUIRE( w1 == Approx( 0.75 ) );
+
+    REQUIRE_FALSE( xlinqCal::refWeights( t, 5, i0, i1, w1 ) );
+    REQUIRE( i0 == 0 );
+    REQUIRE( i1 == 0 );
+    REQUIRE( w1 == 0 );
+
+    REQUIRE_FALSE( xlinqCal::refWeights( t, 50, i0, i1, w1 ) );
+    REQUIRE( i0 == 2 );
+    REQUIRE( i1 == 2 );
+
+    REQUIRE_FALSE( xlinqCal::refWeights( {}, 50, i0, i1, w1 ) );
+}
+
 /// Typed copies convert each supported ImageStreamIO type and reject unknown types.
 TEST_CASE( "isioStream::copyTyped converts types", "[isioStream]" )
 {
@@ -114,8 +146,9 @@ TEST_CASE( "xlinqSim requires the stream prefix", "[xlinqSim]" )
     REQUIRE_THROWS_AS( xlinqCal::xlinqSim( cfg ), std::invalid_argument );
 }
 
-/// End to end against the simulator: recovered responses match amp * R * shape for both cameras,
-/// the timing table is consistent, and the DM channel is restored.
+/// End to end against the simulator: recovered odd responses match amp * R * shape for both cameras,
+/// the camsci1 even part matches amp^2 |H shape|^2 and the (linear) camwfs even part is zero despite
+/// drift, the timing table and references are consistent, and the DM channel is restored.
 TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
 {
     using namespace xlinqCal;
@@ -134,6 +167,9 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
     cfg.wfsNoise     = 1;
     cfg.sciNoise     = 1;
     cfg.drift        = 0.01;
+    cfg.sciQuadGain  = 100;
+    cfg.modevalName  = cfg.prefix + "modevalWFS";
+    cfg.nModes       = 32;
 
     const int   nPoke   = 3;
     const float amp     = 0.1;
@@ -154,7 +190,7 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
                                       "--dm.channel=" + cfg.dmChannel,
                                       "--dm.comb=" + cfg.dmComb,
                                       "--sci.shmim=" + cfg.sciName,
-                                      "--wfs.shmim=" + cfg.wfsName,
+                                      "--wfs.shmim=" + cfg.wfsName + "," + cfg.modevalName,
                                       "--poke.file=" + pokeFile,
                                       "--poke.amp=" + std::to_string( amp ),
                                       "--sci.nFrames=" + std::to_string( nFrames ),
@@ -174,6 +210,7 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
 
     REQUIRE( rv == 0 );
     REQUIRE( app.nDone() == nPoke );
+    REQUIRE( app.nWfs() == 2 );
 
     for( int k = 0; k < nPoke; ++k )
     {
@@ -182,29 +219,77 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
         Eigen::VectorXf sciExp = amp * ( sim.sciR().matrix() * shape );
         Eigen::VectorXf wfsExp = amp * ( sim.wfsR().matrix() * shape );
 
-        Eigen::Map<const Eigen::VectorXf> sciGot( app.sciResp().image( k ).data(), sciExp.size() );
-        Eigen::Map<const Eigen::VectorXf> wfsGot( app.wfsResp().image( k ).data(), wfsExp.size() );
+        Eigen::VectorXf modExp = amp * ( sim.modevalR().matrix() * shape );
+
+        Eigen::Map<const Eigen::VectorXf> sciGot( app.sciProducts().resp.image( k ).data(), sciExp.size() );
+        Eigen::Map<const Eigen::VectorXf> wfsGot( app.wfsProducts( 0 ).resp.image( k ).data(), wfsExp.size() );
+        Eigen::Map<const Eigen::VectorXf> modGot( app.wfsProducts( 1 ).resp.image( k ).data(), modExp.size() );
 
         double sciErr = ( sciGot - sciExp ).norm() / sciExp.norm();
         double wfsErr = ( wfsGot - wfsExp ).norm() / wfsExp.norm();
+        double modErr = ( modGot - modExp ).norm() / modExp.norm();
 
-        INFO( "poke " << k << " sci err " << sciErr << " wfs err " << wfsErr );
+        INFO( "poke " << k << " sci err " << sciErr << " wfs err " << wfsErr << " modeval err " << modErr );
         REQUIRE( sciErr < 0.05 );
         REQUIRE( wfsErr < 0.05 );
+        REQUIRE( modErr < 0.05 );
+    }
+
+    // Even parts, from the output files
+    mx::improc::eigenCube<float> sciEven, wfsEven, sciRef, modEven;
+    REQUIRE( ff.read( modEven, ( dir / ( "test_" + cfg.modevalName + "_even.fits" ) ).string() ) ==
+             mx::error_t::noerror );
+    REQUIRE( modEven.planes() == nPoke );
+    REQUIRE( ff.read( sciEven, ( dir / ( "test_" + cfg.sciName + "_even.fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( ff.read( wfsEven, ( dir / ( "test_" + cfg.wfsName + "_even.fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( ff.read( sciRef, ( dir / ( "test_" + cfg.sciName + "_ref.fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( sciEven.planes() == nPoke );
+    REQUIRE( wfsEven.planes() == nPoke );
+    REQUIRE( app.nRef() == nPoke + 1 );
+    REQUIRE( sciRef.planes() == nPoke + 1 );
+
+    for( int k = 0; k < nPoke; ++k )
+    {
+        Eigen::Map<const Eigen::VectorXf> shape( pokes.image( k ).data(), cfg.dmRows * cfg.dmCols );
+
+        Eigen::ArrayXf sciExp =
+            amp * amp *
+            ( ( sim.sciHr().matrix() * shape ).array().square() + ( sim.sciHi().matrix() * shape ).array().square() );
+        Eigen::VectorXf wfsOdd = amp * ( sim.wfsR().matrix() * shape );
+
+        Eigen::Map<const Eigen::ArrayXf> sciGot( sciEven.image( k ).data(), sciExp.size() );
+        Eigen::Map<const Eigen::ArrayXf> wfsGot( wfsEven.image( k ).data(), wfsOdd.size() );
+
+        double sciErr = ( sciGot - sciExp ).matrix().norm() / sciExp.matrix().norm();
+        double wfsRel = wfsGot.matrix().norm() / wfsOdd.norm();
+
+        Eigen::VectorXf                  modOdd = amp * ( sim.modevalR().matrix() * shape );
+        Eigen::Map<const Eigen::ArrayXf> modGot( modEven.image( k ).data(), modOdd.size() );
+        double                           modRel = modGot.matrix().norm() / modOdd.norm();
+
+        INFO( "poke " << k << " sci even err " << sciErr << " wfs even/odd " << wfsRel << " modeval even/odd "
+                      << modRel );
+        REQUIRE( sciErr < 0.05 );
+        REQUIRE( wfsRel < 0.02 );
+        REQUIRE( modRel < 0.02 );
     }
 
     const std::vector<timingRecord> &timing = app.timing();
-    REQUIRE( timing.size() == nPoke * 4 );
+    REQUIRE( timing.size() == nPoke * 4 + nPoke + 1 );
 
     for( const timingRecord &rec : timing )
     {
+        REQUIRE( rec.size() == timingCol::nCommon + 2 * wfsCol::nCols );
         REQUIRE( rec[timingCol::sciN] == nFrames );
         REQUIRE( rec[timingCol::sciMissed] == 0 );
 
-        // About 50 camwfs frames per camsci1 frame
-        double perFrame = rec[timingCol::wfsN] / nFrames;
-        REQUIRE( perFrame > 40 );
-        REQUIRE( perFrame < 60 );
+        // About 50 frames per camsci1 frame, for both WFS streams
+        for( size_t j = 0; j < 2; ++j )
+        {
+            double perFrame = rec[wfsColIndex( j, wfsCol::n )] / nFrames;
+            REQUIRE( perFrame > 40 );
+            REQUIRE( perFrame < 60 );
+        }
 
         if( !std::isnan( rec[timingCol::dmProj] ) )
         {
@@ -212,9 +297,14 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
         }
     }
 
-    // The second '-' of '+--+' needs no DM write
-    REQUIRE( std::isnan( timing[2][timingCol::dmProj] ) );
-    REQUIRE_FALSE( std::isnan( timing[3][timingCol::dmProj] ) );
+    // Rows: ref, + - - +, ref, ... The first ref and the second '-' need no DM write.
+    REQUIRE( timing[0][timingCol::sign] == 0 );
+    REQUIRE( std::isnan( timing[0][timingCol::dmProj] ) );
+    REQUIRE_FALSE( std::isnan( timing[1][timingCol::dmProj] ) );
+    REQUIRE( std::isnan( timing[3][timingCol::dmProj] ) );
+    REQUIRE_FALSE( std::isnan( timing[4][timingCol::dmProj] ) );
+    REQUIRE( timing[5][timingCol::sign] == 0 );
+    REQUIRE_FALSE( std::isnan( timing[5][timingCol::dmProj] ) );
 
     // The DM channel is restored to its initial (zero) content
     mx::improc::milkImage<float> dm( cfg.dmChannel );
@@ -228,9 +318,10 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
     mx::improc::eigenCube<float> sciFile;
     REQUIRE( ff.read( sciFile, ( dir / ( "test_" + cfg.sciName + "_resp.fits" ) ).string() ) == mx::error_t::noerror );
     REQUIRE( sciFile.planes() == nPoke );
-    size_t nSci = app.sciResp().rows() * app.sciResp().cols() * nPoke;
+    const mx::improc::eigenCube<float> &sciResp = app.sciProducts().resp;
+    size_t                              nSci    = sciResp.rows() * sciResp.cols() * nPoke;
     REQUIRE( ( Eigen::Map<const Eigen::ArrayXf>( sciFile.data(), nSci ) -
-               Eigen::Map<const Eigen::ArrayXf>( app.sciResp().data(), nSci ) )
+               Eigen::Map<const Eigen::ArrayXf>( sciResp.data(), nSci ) )
                  .abs()
                  .maxCoeff() == 0 );
 
@@ -315,6 +406,11 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
     REQUIRE( head["POKE0"].value<int>() == 5 );
     REQUIRE( head["NPOKE"].value<int>() == app.nDone() );
     REQUIRE( head["COMPLETE"].value<int>() == 0 );
+
+    mx::improc::eigenCube<float> evenFile;
+    REQUIRE( ff.read( evenFile, ( dir / ( "stop_" + cfg.wfsName + "_even.fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( evenFile.planes() == app.nDone() );
+    REQUIRE( app.nRef() >= app.nDone() );
 
     dm.close();
     sim.stop();
