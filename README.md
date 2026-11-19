@@ -50,11 +50,20 @@ In `out.dir`, with prefix `out.prefix` (default `xlinqCal_<UTC>`):
 | `<prefix>_<cam>_even.fits` | even part `mean − ref` (ref interpolated in time), one plane per poke. `EVEN1SID` counts planes that used only the nearest reference (e.g. after a stop) |
 | `<prefix>_<cam>_ref.fits` | zero-poke reference frames, in acquisition order |
 | `<prefix>_timing.fits` | one row per acquisition: poke, repeat, sign (0 = reference, with the reference index in REPEAT), DM cnt0 and projection, camsci1 cnt0 range and frame counts, gate times, then for each WFS stream `j` its cnt0 range, frame count, and missed and torn frames (`WjCNT0A`, `WjCNT0B`, `WjN`, `WjMISS`, `WjTORN`). Column names are in `TCOLn` |
+| `<prefix>_pokes.fits` | the applied pokes, `poke.amp` × the requested planes of `poke.file` [µm], with the poke file's header cards copied (copied numeric cards become strings) |
 | `<prefix>_snap_<name>.fits` | content of each `snap.shmim` stream (e.g. `aol1_wfsref`, `aol1_wfsmask`) just before the first poke, saved as float; header has the stream's cnt0 and write time |
 | `<prefix>_snap_<name>_end.fits` | written only if that stream changed during the run (a warning is logged) |
 | `<prefix>.log` | run log |
 
 `<cam>` is the stream name (`camsci1`, and each WFS stream). Headers record the configuration, stream names, datatypes, measured fps, poke range (`POKE0`, `NPOKE`), references (`REFEVERY`, `NREF`), `PRODUCT`, `COMPLETE`, and start/end times. Partial results are checkpointed every `out.checkpointMin` minutes.
+
+## Tools
+
+`tools/shape_pokes.py` makes an amplitude-shaped poke cube from a previous data set. Each mode's amplitude is set so that its camsci1 speckle pair (the even part) carries about `--target` of the PSF flux, capped at `--cap` µm. It works from a smooth fit of the measured speckle energy against spatial frequency. It also fits the geometry from DM frequency to camsci1 pixels, and records the law and geometry in the header. The `AMP` and `FREQ` extensions hold the per-mode amplitude and frequency. Run xlinqCal with `poke.amp=1` on the output.
+
+```
+python3 tools/shape_pokes.py --modes modFourier_48.fits --data try1/xlinqCal_20261119_001 --out modFourier_48_shaped.fits
+```
 
 ## Building and testing
 

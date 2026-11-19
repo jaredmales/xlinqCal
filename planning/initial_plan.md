@@ -225,6 +225,12 @@ xlinqCal/
 
 - 2026-11-19: snapshot streams. `snap.shmim` (example config: `aol1_wfsref,aol1_wfsmask`) lists streams opened at startup (missing = error), written to `<prefix>_snap_<name>.fits` before the first poke, and re-read after the run. A changed stream is also saved as `_snap_<name>_end.fits` with a warning. The code default is empty, so xlinqCal still runs without cacao. Tests cover an unchanged pair (contents verified, no `_end`) and a stream changed mid-run (`_end` written).
 
+- 2026-11-19, first instrument data set (`try1/`, camsci1 at 26.5 Hz, `nFrames=2`, `nRepeat=1`, 2400 Fourier modes at 0.05 µm). Bookkeeping was clean: DM projection 1, no missed sci frames, WFS missed/torn ≈ 0, reference flux drift 0.13%. Even-part SNR ranged from about 450 (low order) to about 10 (corners). The modes are integer cycles per **50** actuators. The camsci1 geometry is about 4.43/4.27 px per cycle/50 act, rotated −27.6°, with 0.7 px fit residual. The amplitude was too large at low order (speckle pair ≈ 20% of PSF flux; WFS even/odd ≈ 0.5). Changes:
+  - The doubled-stream-name check: mxlib joins repeated config keys, which caused the first failed start.
+  - `<prefix>_pokes.fits`: applied pokes with the poke file's header.
+  - `tools/shape_pokes.py`: per-mode amplitude law targeting about 1% speckle energy, capped at 0.05 µm. It gives 0.010 µm at low order to 0.05 µm in the corners, with projected even SNR about 17–24 for |n| < 24 at try1 settings.
+  - `try*/` is ignored by git.
+
 ### 5.8 Follow-ups and edge cases
 - **Memory/output size with full-frame camsci1:** all response planes are held in memory, and checkpoints rewrite the full cubes. For a 1024x1024 camsci1 and 2040 pokes, that is about 8.5 GB per cube. The preflight prints the size. If this is too large, use a camsci1 ROI, or change xlinqCal to append planes to the FITS file as it goes.
 - **Torn camwfs frames:** the `cnt0` check catches a frame replaced after the post. It cannot catch an in-place writer that is midway through copying the *next* frame before incrementing `cnt0`. Reads happen immediately after each post, so this needs the reader to fall about one frame period behind. The counts of missed and torn frames are in the timing table.
