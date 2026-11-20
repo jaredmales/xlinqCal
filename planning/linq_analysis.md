@@ -377,3 +377,27 @@ The earlier per-window weighted means had errors too small by ≈ 3–5× (corre
 - **Bump mask:** not resolved at one-actuator sampling.
 - **Uses:** $P$ for the $\mathbf G$ model and the ideal coronagraph (§9.11); the DM-to-pupil registration; and "cycles per aperture" = $0.92\,n$ (10 cpa ≈ $n$ = 10.9).
 - **Every run gives a quasi-static field estimate** at no extra cost.
+
+### 9.13 From a WFS frame to a speckle prediction: the modal map (2026-11-20)
+**Pipeline (proposed).** For each science exposure:
+1. $\delta z_t = z_t - \bar z$ from `aol1_modevalWFS-sw`, matched to camsci1 frames by atime and exposure time (MagAO-X clocks are synced).
+2. Map to Fourier coefficients $c_t$.
+3. Pupil phase $\varphi_t = \kappa\,\sum_k c_{t,k} m_k$ on the registered pupil $P$ (§9.12), in DM coordinates.
+4. Ideal-coronagraph focal field $\mathcal F\{P(e^{i\varphi_t} - \langle e^{i\varphi_t}\rangle)\}$ at the camsci1 pixels, then average $|\cdot|^2$ over the exposure.
+
+The DM → camsci1 map is the measured affine M: rotation −27.5°, 4% anamorphism, and the twin sign of §9.12, so the effective map is −M. It is fixed because the K-mirror keeps the pupil fixed on the DM (user). Fold M into the propagation (pupil coordinates transformed by $M^{-T}$, then a separable MFT) rather than rotating images. Use several wavelengths across z-band.
+
+**The online modal basis.** `CMmodesDM.fits` holds the online aol1 modes: 1563 modes on the 50×50 grid, from the 2024-11-13 `fklcombo_z10_2400_smoothed_co0.27_pb0.5_mod3` calibration. Compared with the measured `modevalWFSpub` odd responses to the 2400 Fourier pokes:
+- **Projection:** the pseudo-inverse projection onto CMmodesDM fails. The basis is non-orthogonal, with condition number 2570 and 22 mode pairs with normalized overlap > 0.5. The matched filter $\langle$CMmodesDM$_j$, poke$\rangle/\|$CMmodesDM$_j\|^2$ works, with a per-poke correlation of 0.85 and the identity orientation. The top responding modes have the poke's spatial frequency.
+- **Per-mode gains:** fitting a gain per control mode against that projection:
+
+| control modes | 0–20 | 20–100 | 100–300 | 300–600 | 600–1000 | 1000–1300 | 1300–1563 |
+|---|---|---|---|---|---|---|---|
+| try1 (0.05 µm) | 0.85 | 0.94 | 0.94 | 0.83 | 0.75 | 0.70 | 0.65 |
+| try2 (shaped) | 1.01 | 1.01 | 0.91 | 0.77 | 0.61 | 0.50 | 0.43 |
+
+- **Low order:** the gain is ≈ 1 in try2, so `modevalWFS` is in µm of surface. try1's 0.85 is the WFS compression at 0.69 rad.
+- **High order:** the gain falls to 0.4–0.65. try2 is lower than try1 even where both used the same amplitude. camsci1 shows only ≈ 4% amplitude change there, so the cause is mostly on the WFS side (amplitude-dependent response, or the bump mask, if it sits upstream of the pyramid).
+- **Large crosstalk:** a diagonal gain model explains only 71% (try1) and 49% (try2) of the response variance, while noise is 0.1–2%.
+
+**Decision (proposed): use the measured response, not the nominal basis.** Map $z \to c$ with a regularized inverse of the measured response matrix $\mathbf R_{mv}$ (1563 × 2400). For DM nonlinearity, use the per-sign states (mean ± resp, §9.12). CMmodesDM serves as the regularization prior and as a check. $\mathbf R_{mv}$ depends on amplitude (try1 vs try2), so measure it at science-like residual amplitudes, and correct for on-sky optical gain.

@@ -11,4 +11,5 @@ Local notes:
 
 - Simulated stream names must start with `xlsim_` (enforced by `xlinqSim`), so tests can never create or overwrite instrument streams.
 - Run `make test` after any change. The integration tests run xlinqCal in-process against `xlinqSim`.
+- INDI features (state recording, shutter/dark) are tested only with the fake `getINDI`/`setINDI` scripts in the tests (`--indi.get`/`--indi.set`). Never run them, or `getINDI`/`setINDI`, from a workstation with an INDI tunnel to the instrument (MagAOX rule 0).
 - Engineering decisions and execution notes are in `planning/initial_plan.md`.

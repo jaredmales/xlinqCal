@@ -13,7 +13,7 @@ CXXFLAGS += $(shell pkg-config --cflags mxlib) -std=c++20 -Wall -Wextra $(OPTIMI
 CXXFLAGS += -DXLINQCAL_GIT_VERSION=\"$(GIT_VERSION)\" -Isrc -Isim
 LDLIBS   += $(shell pkg-config --libs mxlib) -pthread
 
-HEADERS = src/xlinqCal.hpp src/isioStream.hpp src/wfsChannel.hpp sim/xlinqSim.hpp
+HEADERS = src/xlinqCal.hpp src/isioStream.hpp src/wfsChannel.hpp src/indiClient.hpp sim/xlinqSim.hpp
 
 all: xlinqCal xlinqSim
 

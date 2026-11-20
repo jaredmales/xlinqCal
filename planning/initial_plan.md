@@ -237,6 +237,34 @@ xlinqCal/
   - **Time:** each acquisition uses 1 of 3 camsci1 frames (poke frame discarded, plus `nSettle=1`). Proposed test: 200 modes with `nSettle=0` vs 1. If they agree, `nFrames=2` fits in the same time.
   - **New tools:** `tools/quadrature_field.py` and `tools/test_2f.py`. Results are in `linq_analysis.md` §9.12.
 
+- 2026-11-20: acquisition times and a camsci1 linearity check.
+  - **Timing table:** gains the stream `atime` of the first and last averaged frame for camsci1 (`SCIATIMA`/`SCIATIMB`) and each WFS stream (`WjATIMA`/`WjATIMB`). Clocks across MagAO-X computers are synced (user), so calibration and science data can be matched by atime and exposure time.
+  - **atime source:** `isioStream::copy` reads atime inside the torn-frame check. It uses the per-slice atime array only for temporal circular buffers, as MagAOX `shmimMonitor` does.
+  - **Simulator:** its cameras post with an explicit CLOCK_REALTIME atime (camsci1: end of exposure; modeval: the camwfs frame's atime).
+  - **Linearity:** camsci1 is linear to 37k counts (user). `sci.linearMax` (default 37000, 0 = off) flags acquisitions with any averaged frame above it. Each acquisition's maximum goes in `SCIMAX`; the count goes in `NNONLIN` and the log. The preflight reports the maximum pixel of one frame. In try1, about half of the references had peaks of 37.1–37.9k; try2 stayed below 37.0k.
+  - **Geometry (user):** the K-mirror keeps the pupil fixed on the DM, so the pupil-mask and DM-grid orientations relative to camsci1 are fixed. The measured rotation is −27.5°, stable to 0.1° between runs.
+  - **INDI client (user):** make xlinqCal an INDI client by shelling out to `getINDI`/`setINDI`, to record system state and close the shutter for a dark. Details are in the next entry.
+  - **Online modal basis:** `CMmodesDM.fits` (the online aol1 modes; 1563 modes, the 2024-11-13 `fklcombo_z10_2400…` calibration) was copied into the repo root (untracked). See `linq_analysis.md` §9.13.
+
+- 2026-11-20: INDI state recording and a dark (`src/indiClient.hpp`). Interface facts are from a read-only survey of MagAOX `dev` (`ed8b5697`) and `/opt/MagAOX/config` (`onsky`):
+  - **getINDI cost:** `getINDI dev.prop` sends a named getProperties and exits when the property arrives. Wildcards or `dev` alone make every app re-send all its defs and subscriptions (MagAOX incident 2026-03-11; plan `indiserver-chained-loop`). xlinqCal therefore only gets exact `device.property` names (validated: `[A-Za-z0-9_-]` components) and never dumps all properties.
+  - **setINDI:** an untyped `setINDI` does a device-wide getProperties and silently refuses to send unless every element is listed. With `-s`/`-n` it sends at once and exits 0 when sent, not when applied. `-w` hangs on properties that settle Idle and exits 0 on Alert. xlinqCal uses `-s` and confirms by readback, polling no faster than `indi.poll` (default 2 s; MagAOX asks for ≥ 2 s between named getProperties).
+  - **Calls:** run without a shell (fork/exec), with stdout/stderr captured and a wall-clock kill (`indi.timeout`, default 8 s).
+  - **Shutter (MagAOX stdCamera + dssShutter):**
+    - `camsci1.shutter.toggle` On = shut, Off = open. The command is explicit, not a flip, and asynchronous: a pulse plus sensor poll, up to 2 × 2 s.
+    - Failures are only logged, and the property doesn't go to Alert.
+    - The readback Off also means unknown or power-off, and one power-on code path reported the polarity reversed (since fixed in MagAOX). So xlinqCal trusts the readback only with `shutter_status.status=READY`, and checks both in the preflight. The dark sanity check warns if the dark maximum is above half the preflight maximum.
+    - camsci1 runs `picamCtrl` on ICC. It is visible on RTC via `camsci1@rtc_icc_indi`.
+  - **Dark placement:** after a complete run, with the DM restored, so a shutter problem can't spoil the calibration, and the dark uses the run's exposure settings. The shutter is always commanded open again once shut. A stopped or failed run takes no dark.
+  - **Simulator and tests:** `shutterFile` (content `On` = shut) gives `sciDark` frames. The tests use fake `getINDI`/`setINDI` scripts over a state directory, applying sets after 0.3 s like an asynchronous device. They check:
+    - the state files and header (`SCIEXPT`, `NDARK`);
+    - the dark level;
+    - the shutter left open;
+    - exactly two typed shutter sets;
+    - that every get is one exact `device.property`;
+    - refusal with the shutter shut, not READY, or with `dark.n` but no `indi.enable`.
+  - **Resolved:** the shutter polarity reversal at camera power-on (MagAOX `stdCamera.hpp`, commit `ec9247bc`) was fixed in MagAOX by the operator; the READY check stays as a guard. `fwsci1`, `stagesci1` and `camsci1-dark` are wanted in the run record and will be added to RTC's indiserver remotes by the operator, then listed in `indi.props`. First instrument test: a short run with `dark.n=5` and small `poke.last`, watching the shutter.
+
 ### 5.8 Follow-ups and edge cases
 - **Memory/output size with full-frame camsci1:** all response planes are held in memory, and checkpoints rewrite the full cubes. For a 1024x1024 camsci1 and 2040 pokes, that is about 8.5 GB per cube. The preflight prints the size. If this is too large, use a camsci1 ROI, or change xlinqCal to append planes to the FITS file as it goes.
 - **Torn camwfs frames:** the `cnt0` check catches a frame replaced after the post. It cannot catch an in-place writer that is midway through copying the *next* frame before incrementing `cnt0`. Reads happen immediately after each post, so this needs the reader to fall about one frame period behind. The counts of missed and torn frames are in the timing table.

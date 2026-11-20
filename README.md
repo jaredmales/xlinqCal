@@ -49,13 +49,29 @@ In `out.dir`, with prefix `out.prefix` (default `xlinqCal_<UTC>`):
 | `<prefix>_<cam>_mean.fits` | symmetric mean `(mean(+) + mean(−))/2`, one plane per poke |
 | `<prefix>_<cam>_even.fits` | even part `mean − ref` (ref interpolated in time), one plane per poke. `EVEN1SID` counts planes that used only the nearest reference (e.g. after a stop) |
 | `<prefix>_<cam>_ref.fits` | zero-poke reference frames, in acquisition order |
-| `<prefix>_timing.fits` | one row per acquisition: poke, repeat, sign (0 = reference, with the reference index in REPEAT), DM cnt0 and projection, camsci1 cnt0 range and frame counts, gate times, then for each WFS stream `j` its cnt0 range, frame count, and missed and torn frames (`WjCNT0A`, `WjCNT0B`, `WjN`, `WjMISS`, `WjTORN`). Column names are in `TCOLn` |
+| `<prefix>_timing.fits` | one row per acquisition: poke, repeat, sign (0 = reference, with the reference index in REPEAT), DM cnt0 and projection, camsci1 cnt0 range and frame counts, gate times, the camsci1 acquisition times (stream `atime`) of the first and last averaged frames (`SCIATIMA`, `SCIATIMB`) and the maximum pixel value (`SCIMAX`). Then, for each WFS stream `j`: its cnt0 range, frame count, missed and torn frames, and first and last atimes (`WjCNT0A`, `WjCNT0B`, `WjN`, `WjMISS`, `WjTORN`, `WjATIMA`, `WjATIMB`). Times are Unix seconds; atimes are as written by the stream's producer (the camera frame timestamp for MagAO-X cameras). Column names are in `TCOLn` |
 | `<prefix>_pokes.fits` | the applied pokes, `poke.amp` × the requested planes of `poke.file` [µm], with the poke file's header cards copied (copied numeric cards become strings) |
 | `<prefix>_snap_<name>.fits` | content of each `snap.shmim` stream (e.g. `aol1_wfsref`, `aol1_wfsmask`) just before the first poke, saved as float; header has the stream's cnt0 and write time |
 | `<prefix>_snap_<name>_end.fits` | written only if that stream changed during the run (a warning is logged) |
+| `<prefix>_indi.txt`, `<prefix>_indi_end.txt` | with `indi.enable`: INDI state at the start and end, one `device.property.element=value` line per element (getINDI's format); unreadable properties are noted with `#` |
+| `<prefix>_camsci1_dark.fits` | with `dark.n` > 0: mean of `dark.n` camsci1 frames taken with the shutter shut after a complete run |
 | `<prefix>.log` | run log |
 
-`<cam>` is the stream name (`camsci1`, and each WFS stream). Headers record the configuration, stream names, datatypes, measured fps, poke range (`POKE0`, `NPOKE`), references (`REFEVERY`, `NREF`), `PRODUCT`, `COMPLETE`, and start/end times. Partial results are checkpointed every `out.checkpointMin` minutes.
+`<cam>` is the stream name (`camsci1`, and each WFS stream). Headers record the configuration, stream names, datatypes, measured fps, poke range (`POKE0`, `NPOKE`), references (`REFEVERY`, `NREF`), the camsci1 linearity limit and count (`SCILINMX`, `NNONLIN`), the INDI exposure time and EM gain (`SCIEXPT`, `SCIEMGN`) and dark frame count (`NDARK`), `PRODUCT`, `COMPLETE`, and start/end times. Partial results are checkpointed every `out.checkpointMin` minutes.
+
+## INDI: system state and dark
+
+xlinqCal is a minimal INDI client. It shells out to MagAO-X's `getINDI` and `setINDI`, and makes no INDI calls unless `indi.enable=true`.
+
+- **State:** at the start and end it records the camera's `fsm`, `exptime`, `emgain`, `fps`, `shutter_status`, and `shutter` properties, plus `indi.props`, to `_indi.txt` / `_indi_end.txt`. A change in exposure time or EM gain during the run is logged as a warning.
+- **Dark:** with `dark.n` > 0, the preflight requires `<sci.device>.shutter_status.status=READY` and the shutter open, and refuses to start otherwise. After a complete run, with the DM restored, it:
+  1. shuts the shutter (`setINDI -s <dev>.shutter.toggle=On`) and waits for the readback;
+  2. discards `dark.discard` frames, then averages `dark.n` frames;
+  3. opens the shutter again and confirms it.
+
+  Once shut, the shutter is always commanded open again, also after a stop or error; if that can't be confirmed, the log says so loudly. A stopped or failed run takes no dark.
+- **MagAOX rules for INDI clients:** every get is one exact `device.property` (no wildcards, no device-wide or all-property requests). Every set is type-flagged. Each call has a wall-clock limit (`indi.timeout`), and readbacks are polled every `indi.poll` s (default 2, the MagAOX minimum).
+- **Reachability on RTC:** `camsci1` is visible through RTC's indiserver. `fwsci1`, `stagesci1`, and `camsci1-dark` need to be added to RTC's indiserver remotes before they can go in `indi.props`.
 
 ## Tools
 

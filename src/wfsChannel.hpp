@@ -48,6 +48,10 @@ struct wfsGateStats
     uint64_t cnt0First{ 0 }; ///< cnt0 of the first accumulated frame.
 
     uint64_t cnt0Last{ 0 }; ///< cnt0 of the last accumulated frame.
+
+    double atimeFirst{ 0 }; ///< Acquisition time of the first accumulated frame, Unix seconds.
+
+    double atimeLast{ 0 }; ///< Acquisition time of the last accumulated frame, Unix seconds.
 };
 
 /// A WFS stream (camera frames, calibrated frames, or modal coefficients) read by its own thread.
@@ -266,6 +270,7 @@ inline bool wfsChannel::closeGate( mx::improc::eigenImage<double> &mean, wfsGate
 inline void wfsChannel::exec()
 {
     mx::improc::eigenImage<double> frame;
+    timespec                       atime{};
 
     while( m_run )
     {
@@ -283,7 +288,7 @@ inline void wfsChannel::exec()
         }
 
         uint64_t cnt0;
-        bool     ok = m_stream.copy( frame, cnt0 );
+        bool     ok = m_stream.copy( frame, cnt0, atime );
 
         if( cnt0 == m_lastSeen )
         {
@@ -306,11 +311,13 @@ inline void wfsChannel::exec()
                 {
                     if( m_stats.n == 0 )
                     {
-                        m_stats.cnt0First = cnt0;
+                        m_stats.cnt0First  = cnt0;
+                        m_stats.atimeFirst = tsSec( atime );
                     }
 
                     m_sum += frame;
-                    m_stats.cnt0Last = cnt0;
+                    m_stats.cnt0Last  = cnt0;
+                    m_stats.atimeLast = tsSec( atime );
                     ++m_stats.n;
                 }
                 else

@@ -8,12 +8,14 @@
 #define xlinqCal_hpp
 
 #include <limits>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -26,6 +28,7 @@
 #include <mx/improc/milkImage.hpp>
 #include <mx/ioutils/fits/fitsFile.hpp>
 
+#include "indiClient.hpp"
 #include "isioStream.hpp"
 #include "wfsChannel.hpp"
 
@@ -62,18 +65,21 @@ namespace timingCol
 {
 enum : int
 {
-    poke,         ///< Poke index in the input cube, NaN for a reference.
-    repeat,       ///< Repeat index, or the reference index for a reference.
-    sign,         ///< Poke sign, +1 or -1, or 0 for a reference.
-    dmCnt0,       ///< cnt0 of the combined DM stream when the poke was confirmed, NaN if no DM write.
-    dmProj,       ///< Projection of the combined DM change onto the commanded change, NaN if no DM write.
-    sciCnt0First, ///< cnt0 of the first averaged camsci1 frame.
-    sciCnt0Last,  ///< cnt0 of the last averaged camsci1 frame.
-    sciN,         ///< Number of camsci1 frames averaged.
-    sciMissed,    ///< camsci1 frames skipped (cnt0 gaps) during averaging.
-    tStart,       ///< Gate open time, Unix seconds.
-    tEnd,         ///< Gate close time, Unix seconds.
-    nCommon       ///< The number of common columns; per-WFS-stream columns follow.
+    poke,          ///< Poke index in the input cube, NaN for a reference.
+    repeat,        ///< Repeat index, or the reference index for a reference.
+    sign,          ///< Poke sign, +1 or -1, or 0 for a reference.
+    dmCnt0,        ///< cnt0 of the combined DM stream when the poke was confirmed, NaN if no DM write.
+    dmProj,        ///< Projection of the combined DM change onto the commanded change, NaN if no DM write.
+    sciCnt0First,  ///< cnt0 of the first averaged camsci1 frame.
+    sciCnt0Last,   ///< cnt0 of the last averaged camsci1 frame.
+    sciN,          ///< Number of camsci1 frames averaged.
+    sciMissed,     ///< camsci1 frames skipped (cnt0 gaps) during averaging.
+    tStart,        ///< Gate open time, Unix seconds.
+    tEnd,          ///< Gate close time, Unix seconds.
+    sciAtimeFirst, ///< Acquisition time (stream atime) of the first averaged camsci1 frame, Unix seconds.
+    sciAtimeLast,  ///< Acquisition time (stream atime) of the last averaged camsci1 frame, Unix seconds.
+    sciMax,        ///< Maximum pixel value over the averaged camsci1 frames.
+    nCommon        ///< The number of common columns; per-WFS-stream columns follow.
 };
 } // namespace timingCol
 
@@ -82,12 +88,14 @@ namespace wfsCol
 {
 enum : int
 {
-    cnt0First, ///< cnt0 of the first averaged frame.
-    cnt0Last,  ///< cnt0 of the last averaged frame.
-    n,         ///< Number of frames averaged.
-    missed,    ///< Frames skipped (cnt0 gaps) while the gate was open.
-    torn,      ///< Frames dropped because they changed during the copy.
-    nCols      ///< The number of columns per WFS stream.
+    cnt0First,  ///< cnt0 of the first averaged frame.
+    cnt0Last,   ///< cnt0 of the last averaged frame.
+    n,          ///< Number of frames averaged.
+    missed,     ///< Frames skipped (cnt0 gaps) while the gate was open.
+    torn,       ///< Frames dropped because they changed during the copy.
+    atimeFirst, ///< Acquisition time (stream atime) of the first averaged frame, Unix seconds.
+    atimeLast,  ///< Acquisition time (stream atime) of the last averaged frame, Unix seconds.
+    nCols       ///< The number of columns per WFS stream.
 };
 } // namespace wfsCol
 
@@ -136,9 +144,31 @@ class xlinqCal : public mx::app::application
 
     double m_sciWait{ 5.0 }; ///< Timeout in seconds for each camsci1 frame.
 
+    double m_sciLinearMax{ 37000 }; ///< camsci1 linearity limit [counts]; frames above it are flagged, 0 disables.
+
     std::vector<std::string> m_wfsNames{ "camwfs" }; ///< The WFS streams, averaged over the camsci1 windows.
 
     std::vector<std::string> m_snapNames; ///< Streams saved at the start (and end, if changed), e.g. aol1_wfsref.
+
+    bool m_indiEnable{ false }; ///< If true, record INDI state and allow a dark; no INDI calls are made otherwise.
+
+    std::string m_indiGet{ "getINDI" }; ///< The getINDI command.
+
+    std::string m_indiSet{ "setINDI" }; ///< The setINDI command.
+
+    double m_indiTimeout{ 8 }; ///< Wall-clock limit for each INDI call [s].
+
+    double m_indiPoll{ 2 }; ///< Interval between INDI readbacks while waiting [s]; MagAOX asks for >= 2 s.
+
+    std::vector<std::string> m_indiProps; ///< Extra `device.property` names recorded at start and end.
+
+    std::string m_sciDevice{ "camsci1" }; ///< The INDI device of the science camera.
+
+    unsigned m_darkN{ 0 }; ///< camsci1 frames averaged for the dark after the run, 0 for no dark.
+
+    unsigned m_darkDiscard{ 2 }; ///< camsci1 frames discarded after the shutter closes.
+
+    double m_darkWait{ 15 }; ///< Timeout [s] for the shutter to reach the requested state.
 
     unsigned m_nRepeat{ 2 }; ///< Number of +/- pairs per poke, with alternating order.
 
@@ -165,6 +195,18 @@ class xlinqCal : public mx::app::application
     std::vector<std::unique_ptr<wfsChannel>> m_wfs; ///< The WFS streams, each with its own reader thread.
 
     std::vector<std::unique_ptr<isioStream>> m_snap; ///< The snapshot streams, opened without semaphores.
+
+    indiClient m_indi; ///< The INDI client (getINDI/setINDI).
+
+    std::map<std::string, std::string> m_indiStart; ///< INDI state at the start, `device.property.element` to value.
+
+    double m_sciExptime{ std::numeric_limits<double>::quiet_NaN() }; ///< camsci1 exposure time from INDI [s].
+
+    double m_sciEmgain{ std::numeric_limits<double>::quiet_NaN() }; ///< camsci1 EM gain from INDI.
+
+    bool m_shutterShut{ false }; ///< True if xlinqCal shut the camsci1 shutter and has not confirmed it open again.
+
+    unsigned m_darkTaken{ 0 }; ///< Frames in the saved dark, 0 if none.
 
     std::vector<mx::improc::eigenImage<float>> m_snapStart; ///< Snapshot content at the start of measurement.
 
@@ -197,6 +239,10 @@ class xlinqCal : public mx::app::application
     std::vector<timingRecord> m_timing; ///< One timing row per acquisition.
 
     double m_sciFps{ 0 }; ///< camsci1 frame rate measured during preflight.
+
+    double m_sciPreMax{ 0 }; ///< Maximum camsci1 pixel value in a frame read during preflight.
+
+    int m_nNonlin{ 0 }; ///< Number of acquisitions with a camsci1 frame above m_sciLinearMax.
 
     uint64_t m_sciLastCnt0{ 0 }; ///< cnt0 of the last camsci1 frame received.
 
@@ -246,6 +292,9 @@ class xlinqCal : public mx::app::application
 
     /// Get the number of completed response planes.
     int nDone() const;
+
+    /// Get the number of acquisitions with a camsci1 pixel above sci.linearMax.
+    int nNonlin() const;
 
     /// Get the timing table.
     const std::vector<timingRecord> &timing() const;
@@ -375,7 +424,8 @@ class xlinqCal : public mx::app::application
     /** \returns 0 on success, 1 if stopped, -1 on timeout or error
      */
     int waitSciFrame( mx::improc::eigenImage<double> *frame, /**< [out] the frame, or nullptr to only wait */
-                      uint64_t                       &cnt0 /**< [out] the frame counter */ );
+                      uint64_t                       &cnt0,  /**< [out] the frame counter */
+                      timespec                       *atime = nullptr /**< [out] the frame's atime, if not null */ );
 
     /// Acquire synchronized camsci1 and WFS means for the current DM state.
     /** \returns 0 on success, 1 if stopped, -1 on error
@@ -413,6 +463,34 @@ class xlinqCal : public mx::app::application
     /** \returns 0 on success (changed or not), -1 on error
      */
     int checkEndSnapshots();
+
+    /// The INDI properties recorded at start and end: the camera's standard ones, then indi.props.
+    std::vector<std::string> indiPropList() const;
+
+    /// Check INDI before the run: the camera device answers, and for a dark the shutter is ready and open.
+    /** \returns 0 on success (or INDI disabled), -1 on error
+     */
+    int indiPreflight();
+
+    /// Record the INDI properties to `<prefix><suffix>`, one `device.property.element=value` line each.
+    /** Properties that can't be read are noted in the file and logged; they are not errors.
+     * \returns 0 on success, -1 if the file can't be written
+     */
+    int indiRecord( const std::string                  &suffix, /**< [in] appended to the output prefix */
+                    std::map<std::string, std::string> &vals /**< [out] `device.property.element` to value */ );
+
+    /// Command the camsci1 shutter and wait for the readback.
+    /** `shutter.toggle` On is shut and Off is open (MagAOX stdCamera); the readback is polled every
+     * indi.poll seconds until it matches or dark.wait passes.
+     * \returns 0 when the readback matches, -1 on error or timeout
+     */
+    int setShutter( bool shut /**< [in] true to shut */ );
+
+    /// Take the dark after the run: shut, discard, average dark.n frames, open, and save `_<sci>_dark.fits`.
+    /** The shutter is always commanded open again once shut, even on error or stop.
+     * \returns 0 on success, 1 if stopped, -1 on error
+     */
+    int takeDark();
 
     /// Restore the DM channel to its initial content.
     void restoreDm();
@@ -518,6 +596,11 @@ inline void xlinqCal::clearStop()
 inline int xlinqCal::nDone() const
 {
     return m_nDone;
+}
+
+inline int xlinqCal::nNonlin() const
+{
+    return m_nNonlin;
 }
 
 inline const std::vector<timingRecord> &xlinqCal::timing() const
@@ -689,6 +772,17 @@ inline void xlinqCal::setupConfig()
                 "float",
                 "Timeout [s] for each science frame. Default 5." );
 
+    config.add( "sci.linearMax",
+                "",
+                "sci.linearMax",
+                argType::Required,
+                "sci",
+                "linearMax",
+                false,
+                "float",
+                "Science camera linearity limit [counts]. Acquisitions with a pixel above it are counted and warned; "
+                "0 disables. Default 37000." );
+
     config.add( "wfs.shmim",
                 "",
                 "wfs.shmim",
@@ -709,6 +803,100 @@ inline void xlinqCal::setupConfig()
                 "vector<string>",
                 "Streams to save at the start (and end, if changed), comma separated, e.g. "
                 "aol1_wfsref,aol1_wfsmask. Default none." );
+
+    config.add( "indi.enable",
+                "",
+                "indi.enable",
+                argType::Required,
+                "indi",
+                "enable",
+                false,
+                "bool",
+                "Record INDI state (getINDI) at start and end, and allow a dark. No INDI calls are made unless true. "
+                "Default false." );
+    config.add( "indi.get",
+                "",
+                "indi.get",
+                argType::Required,
+                "indi",
+                "get",
+                false,
+                "string",
+                "The getINDI command. Default getINDI." );
+    config.add( "indi.set",
+                "",
+                "indi.set",
+                argType::Required,
+                "indi",
+                "set",
+                false,
+                "string",
+                "The setINDI command. Default setINDI." );
+    config.add( "indi.timeout",
+                "",
+                "indi.timeout",
+                argType::Required,
+                "indi",
+                "timeout",
+                false,
+                "float",
+                "Wall-clock limit for each INDI call [s]. Default 8." );
+    config.add( "indi.poll",
+                "",
+                "indi.poll",
+                argType::Required,
+                "indi",
+                "poll",
+                false,
+                "float",
+                "Interval between readbacks while waiting for a property [s]. Default 2 (the MagAOX minimum)." );
+    config.add( "indi.props",
+                "",
+                "indi.props",
+                argType::Required,
+                "indi",
+                "props",
+                false,
+                "vector<string>",
+                "Extra device.property names to record, comma separated (exact names only, no wildcards). "
+                "Default none." );
+    config.add( "sci.device",
+                "",
+                "sci.device",
+                argType::Required,
+                "sci",
+                "device",
+                false,
+                "string",
+                "The science camera INDI device, for exposure time, EM gain, and the shutter. Default camsci1." );
+    config.add( "dark.n",
+                "",
+                "dark.n",
+                argType::Required,
+                "dark",
+                "n",
+                false,
+                "int",
+                "Frames averaged for a dark taken with the shutter closed after a complete run; needs "
+                "indi.enable. 0 for no dark. Default 0." );
+    config.add( "dark.discard",
+                "",
+                "dark.discard",
+                argType::Required,
+                "dark",
+                "discard",
+                false,
+                "int",
+                "Frames discarded after the shutter closes. Default 2." );
+    config.add( "dark.wait",
+                "",
+                "dark.wait",
+                argType::Required,
+                "dark",
+                "wait",
+                false,
+                "float",
+                "Timeout for the shutter to reach the requested state [s]. Default 15." );
 
     config.add( "seq.nRepeat",
                 "",
@@ -788,9 +976,23 @@ inline void xlinqCal::loadConfig()
     config( m_sciSettle, "sci.nSettle" );
     config( m_sciFrames, "sci.nFrames" );
     config( m_sciWait, "sci.wait" );
+    config( m_sciLinearMax, "sci.linearMax" );
 
     config( m_wfsNames, "wfs.shmim" );
     config( m_snapNames, "snap.shmim" );
+    config( m_indiEnable, "indi.enable" );
+    config( m_indiGet, "indi.get" );
+    config( m_indiSet, "indi.set" );
+    config( m_indiTimeout, "indi.timeout" );
+    config( m_indiPoll, "indi.poll" );
+    config( m_indiProps, "indi.props" );
+    config( m_sciDevice, "sci.device" );
+    config( m_darkN, "dark.n" );
+    config( m_darkDiscard, "dark.discard" );
+    config( m_darkWait, "dark.wait" );
+
+    m_indi.commands( m_indiGet, m_indiSet );
+    m_indi.timeout( m_indiTimeout );
 
     config( m_nRepeat, "seq.nRepeat" );
 
@@ -827,13 +1029,29 @@ inline int xlinqCal::execute()
         return -1;
     }
 
+    if( m_darkN > 0 && !m_indiEnable )
+    {
+        logError( "dark.n > 0 needs indi.enable=true" );
+        return -1;
+    }
+
     int rv = preflight();
     if( rv != 0 )
     {
         return rv;
     }
 
+    if( indiPreflight() < 0 )
+    {
+        return -1;
+    }
+
     if( setupOutput() < 0 || savePokes() < 0 || saveStartSnapshots() < 0 )
+    {
+        return -1;
+    }
+
+    if( m_indiEnable && indiRecord( "_indi.txt", m_indiStart ) < 0 )
     {
         return -1;
     }
@@ -861,12 +1079,51 @@ inline int xlinqCal::execute()
         rv = -1;
     }
 
+    if( m_darkN > 0 && rv == 0 )
+    {
+        int drv = takeDark();
+
+        if( drv != 0 )
+        {
+            logError( "no dark saved" );
+            rv = drv;
+        }
+    }
+    else if( m_darkN > 0 )
+    {
+        log( "run did not complete: no dark taken" );
+    }
+
+    if( m_indiEnable )
+    {
+        std::map<std::string, std::string> endVals;
+        indiRecord( "_indi_end.txt", endVals );
+
+        for( const char *e : { ".exptime.current", ".emgain.current" } )
+        {
+            std::string key = m_sciDevice + e;
+            auto        a   = m_indiStart.find( key );
+            auto        b   = endVals.find( key );
+
+            if( a != m_indiStart.end() && b != endVals.end() && a->second != b->second )
+            {
+                log( "warning: " + key + " changed during the run: " + a->second + " -> " + b->second );
+            }
+        }
+    }
+
     clock_gettime( CLOCK_REALTIME, &ts );
     m_dateEnd = isoTime( ts );
 
     if( writeOutput( true ) < 0 )
     {
         rv = -1;
+    }
+
+    if( m_nNonlin > 0 )
+    {
+        log( "warning: " + std::to_string( m_nNonlin ) + " acquisitions had " + m_sciName +
+             " pixels above sci.linearMax=" + std::to_string( m_sciLinearMax ) + " (see the SCIMAX timing column)" );
     }
 
     if( rv == 0 )
@@ -1075,6 +1332,13 @@ inline int xlinqCal::preflight()
         wfsPix += m_wfs[j]->stream().rows() * m_wfs[j]->stream().cols();
     }
 
+    {
+        mx::improc::eigenImage<double> frame;
+        uint64_t                       cnt0;
+        m_sci.copy( frame, cnt0 );
+        m_sciPreMax = frame.maxCoeff();
+    }
+
     std::vector<int> signs         = signSequence( m_nRepeat );
     int              nPoke         = m_pokeLast - m_pokeFirst + 1;
     double           framesPerPoke = settleCount( signs ) * ( 1.0 + m_sciSettle ) + signs.size() * m_sciFrames;
@@ -1097,7 +1361,12 @@ inline int xlinqCal::preflight()
     os << "  pokes:   " << m_pokeFile << " [" << m_pokeFirst << "-" << m_pokeLast << "] = " << nPoke << " pokes, amp "
        << m_pokeAmp << " um rms\n";
     os << "  sci:     " << m_sciName << " " << m_sci.rows() << "x" << m_sci.cols() << " type " << (int)m_sci.datatype()
-       << " at " << m_sciFps << " fps\n";
+       << " at " << m_sciFps << " fps, max pixel " << m_sciPreMax;
+    if( m_sciLinearMax > 0 )
+    {
+        os << " (linear limit " << m_sciLinearMax << ( m_sciPreMax > m_sciLinearMax ? ", EXCEEDED" : "" ) << ")";
+    }
+    os << "\n";
     for( size_t j = 0; j < m_wfs.size(); ++j )
     {
         const isioStream &ws = m_wfs[j]->stream();
@@ -1107,6 +1376,14 @@ inline int xlinqCal::preflight()
     }
     os << "  timing:  discard 1+" << m_sciSettle << ", average " << m_sciFrames << " sci frames, sequence " << seq
        << ", reference every " << m_refEvery << " pokes (" << nRef << " total)\n";
+    if( m_indiEnable )
+    {
+        os << "  indi:    record " << indiPropList().size() << " properties at start and end; ";
+        os << ( m_darkN > 0 ? "dark of " + std::to_string( m_darkN ) + " frames after the run (" + m_sciDevice +
+                                  " shutter shut, then opened)"
+                            : std::string( "no dark" ) )
+           << "\n";
+    }
     os << "  estimate: " << hours << " h, " << gbytes << " GB output";
     log( os.str() );
 
@@ -1405,7 +1682,7 @@ inline int xlinqCal::applyCommand( const mx::improc::eigenImage<float> &cmd, tim
     return 0;
 }
 
-inline int xlinqCal::waitSciFrame( mx::improc::eigenImage<double> *frame, uint64_t &cnt0 )
+inline int xlinqCal::waitSciFrame( mx::improc::eigenImage<double> *frame, uint64_t &cnt0, timespec *atime )
 {
     double tWait = nowSec() + m_sciWait;
 
@@ -1448,9 +1725,19 @@ inline int xlinqCal::waitSciFrame( mx::improc::eigenImage<double> *frame, uint64
         {
             cnt0 = m_sci.cnt0();
         }
-        else if( !m_sci.copy( *frame, cnt0 ) )
+        else
         {
-            continue; // Torn: wait for the next frame, the gap is counted as missed
+            timespec at;
+
+            if( !m_sci.copy( *frame, cnt0, at ) )
+            {
+                continue; // Torn: wait for the next frame, the gap is counted as missed
+            }
+
+            if( atime != nullptr )
+            {
+                *atime = at;
+            }
         }
 
         m_sciLastCnt0 = cnt0;
@@ -1496,10 +1783,12 @@ inline int xlinqCal::acquire( bool                                         settl
 
     uint64_t sciMissed = 0;
     uint64_t prev      = m_sciLastCnt0;
+    timespec atime{};
+    double   sciMax = -std::numeric_limits<double>::infinity();
 
     for( unsigned n = 0; n < m_sciFrames; ++n )
     {
-        if( ( rv = waitSciFrame( &frame, cnt0 ) ) != 0 )
+        if( ( rv = waitSciFrame( &frame, cnt0, &atime ) ) != 0 )
         {
             wfsGateStats st;
             for( size_t j = 0; j < m_wfs.size(); ++j )
@@ -1512,7 +1801,8 @@ inline int xlinqCal::acquire( bool                                         settl
 
         if( n == 0 )
         {
-            rec[timingCol::sciCnt0First] = cnt0;
+            rec[timingCol::sciCnt0First]  = cnt0;
+            rec[timingCol::sciAtimeFirst] = tsSec( atime );
         }
         else if( cnt0 > prev + 1 )
         {
@@ -1521,6 +1811,21 @@ inline int xlinqCal::acquire( bool                                         settl
 
         prev = cnt0;
         sciSum += frame;
+        sciMax = std::max( sciMax, frame.maxCoeff() );
+    }
+
+    rec[timingCol::sciAtimeLast] = tsSec( atime );
+    rec[timingCol::sciMax]       = sciMax;
+
+    if( m_sciLinearMax > 0 && sciMax > m_sciLinearMax )
+    {
+        if( m_nNonlin == 0 )
+        {
+            log( "warning: " + m_sciName + " pixel value " + std::to_string( sciMax ) + " is above sci.linearMax=" +
+                 std::to_string( m_sciLinearMax ) + "; further occurrences are counted, not logged" );
+        }
+
+        ++m_nNonlin;
     }
 
     bool allFrames = true;
@@ -1535,11 +1840,13 @@ inline int xlinqCal::acquire( bool                                         settl
             allFrames = false;
         }
 
-        rec[wfsColIndex( j, wfsCol::cnt0First )] = st.cnt0First;
-        rec[wfsColIndex( j, wfsCol::cnt0Last )]  = st.cnt0Last;
-        rec[wfsColIndex( j, wfsCol::n )]         = st.n;
-        rec[wfsColIndex( j, wfsCol::missed )]    = st.missed;
-        rec[wfsColIndex( j, wfsCol::torn )]      = st.torn;
+        rec[wfsColIndex( j, wfsCol::cnt0First )]  = st.cnt0First;
+        rec[wfsColIndex( j, wfsCol::cnt0Last )]   = st.cnt0Last;
+        rec[wfsColIndex( j, wfsCol::n )]          = st.n;
+        rec[wfsColIndex( j, wfsCol::missed )]     = st.missed;
+        rec[wfsColIndex( j, wfsCol::torn )]       = st.torn;
+        rec[wfsColIndex( j, wfsCol::atimeFirst )] = st.atimeFirst;
+        rec[wfsColIndex( j, wfsCol::atimeLast )]  = st.atimeLast;
     }
 
     rec[timingCol::tEnd]        = nowSec();
@@ -1700,6 +2007,280 @@ inline void xlinqCal::restoreDm()
     log( "restored " + m_dmChannel );
 }
 
+inline std::vector<std::string> xlinqCal::indiPropList() const
+{
+    std::vector<std::string> props;
+
+    for( const char *p : { ".fsm", ".exptime", ".emgain", ".fps", ".shutter_status", ".shutter" } )
+    {
+        props.push_back( m_sciDevice + p );
+    }
+
+    for( const std::string &p : m_indiProps )
+    {
+        if( std::find( props.begin(), props.end(), p ) == props.end() )
+        {
+            props.push_back( p );
+        }
+    }
+
+    return props;
+}
+
+inline int xlinqCal::indiPreflight()
+{
+    if( !m_indiEnable )
+    {
+        return 0;
+    }
+
+    if( !indiClient::validName( m_sciDevice + ".exptime", 1 ) )
+    {
+        logError( "invalid sci.device '" + m_sciDevice + "'" );
+        return -1;
+    }
+
+    for( const std::string &p : m_indiProps )
+    {
+        if( !indiClient::validName( p, 1 ) )
+        {
+            logError( "invalid indi.props entry '" + p + "' (expected device.property, no wildcards)" );
+            return -1;
+        }
+    }
+
+    std::string val, err;
+
+    if( m_indi.getElement( m_sciDevice + ".exptime.current", val, err ) < 0 )
+    {
+        logError( "INDI check failed: " + err );
+        return -1;
+    }
+
+    log( "INDI: " + m_sciDevice + " exposure time " + val + " s" );
+
+    if( m_darkN == 0 )
+    {
+        return 0;
+    }
+
+    if( m_indi.getElement( m_sciDevice + ".shutter_status.status", val, err ) < 0 )
+    {
+        logError( "INDI shutter check failed: " + err );
+        return -1;
+    }
+
+    if( val != "READY" )
+    {
+        logError( m_sciDevice + " shutter status is " + val + ", not READY: can't take a dark" );
+        return -1;
+    }
+
+    if( m_indi.getElement( m_sciDevice + ".shutter.toggle", val, err ) < 0 )
+    {
+        logError( "INDI shutter check failed: " + err );
+        return -1;
+    }
+
+    if( val != "Off" )
+    {
+        logError( m_sciDevice + " shutter is shut (shutter.toggle=" + val + "): open it before calibrating" );
+        return -1;
+    }
+
+    return 0;
+}
+
+inline int xlinqCal::indiRecord( const std::string &suffix, std::map<std::string, std::string> &vals )
+{
+    vals.clear();
+
+    timespec ts;
+    clock_gettime( CLOCK_REALTIME, &ts );
+
+    std::string   file = outputPath( suffix );
+    std::ofstream fout( file );
+
+    if( !fout )
+    {
+        logError( "could not write " + file );
+        return -1;
+    }
+
+    fout << "# xlinqCal " << XLINQCAL_GIT_VERSION << " INDI state at " << isoTime( ts ) << " UTC\n";
+
+    int nBad = 0;
+
+    for( const std::string &p : indiPropList() )
+    {
+        std::map<std::string, std::string> elems;
+        std::string                        raw, err;
+
+        if( m_indi.getProperty( p, elems, raw, err ) < 0 )
+        {
+            fout << "# " << p << ": " << err << "\n";
+            log( "warning: INDI " + err );
+            ++nBad;
+            continue;
+        }
+
+        fout << raw;
+
+        for( const auto &e : elems )
+        {
+            vals[p + "." + e.first] = e.second;
+        }
+    }
+
+    if( suffix == "_indi.txt" )
+    {
+        auto num = [&]( const std::string &key )
+        {
+            auto it = vals.find( m_sciDevice + key );
+            return it == vals.end() ? std::numeric_limits<double>::quiet_NaN() : atof( it->second.c_str() );
+        };
+
+        m_sciExptime = num( ".exptime.current" );
+        m_sciEmgain  = num( ".emgain.current" );
+    }
+
+    log( "recorded INDI state to " + file + ( nBad > 0 ? " (" + std::to_string( nBad ) + " unreadable)" : "" ) );
+
+    return 0;
+}
+
+inline int xlinqCal::setShutter( bool shut )
+{
+    std::string elem = m_sciDevice + ".shutter.toggle";
+    std::string want = shut ? "On" : "Off";
+    std::string val, err;
+
+    if( m_indi.setSwitch( elem, shut, err ) < 0 )
+    {
+        logError( "shutter command failed: " + err );
+        return -1;
+    }
+
+    double tEnd = nowSec() + m_darkWait;
+
+    while( true )
+    {
+        std::this_thread::sleep_for( std::chrono::duration<double>( m_indiPoll ) );
+
+        if( m_indi.getElement( elem, val, err ) == 0 && val == want )
+        {
+            log( m_sciDevice + " shutter " + ( shut ? "shut" : "open" ) );
+            return 0;
+        }
+
+        if( nowSec() > tEnd )
+        {
+            logError( m_sciDevice + " shutter did not " + ( shut ? "shut" : "open" ) + " within dark.wait (" + elem +
+                      "=" + ( err.empty() ? val : err ) + ")" );
+            return -1;
+        }
+    }
+}
+
+inline int xlinqCal::takeDark()
+{
+    log( "taking dark: " + std::to_string( m_darkN ) + " frames" );
+
+    if( setShutter( true ) < 0 )
+    {
+        // It may have shut late: always command it open again
+        m_shutterShut = true;
+
+        if( setShutter( false ) == 0 )
+        {
+            m_shutterShut = false;
+        }
+        else
+        {
+            logError( "THE " + m_sciDevice + " SHUTTER MAY BE SHUT: check and open it" );
+        }
+
+        return -1;
+    }
+
+    m_shutterShut = true;
+
+    timespec ts;
+    clock_gettime( CLOCK_REALTIME, &ts );
+    std::string darkBeg = isoTime( ts );
+
+    int                            rv = 0;
+    uint64_t                       cnt0;
+    mx::improc::eigenImage<double> frame;
+    mx::improc::eigenImage<double> sum( m_sci.rows(), m_sci.cols() );
+    sum.setZero();
+
+    m_sci.flush();
+    m_sciLastCnt0 = m_sci.cnt0();
+
+    for( unsigned n = 0; n < m_darkDiscard && rv == 0; ++n )
+    {
+        rv = waitSciFrame( nullptr, cnt0 );
+    }
+
+    for( unsigned n = 0; n < m_darkN && rv == 0; ++n )
+    {
+        if( ( rv = waitSciFrame( &frame, cnt0 ) ) == 0 )
+        {
+            sum += frame;
+        }
+    }
+
+    clock_gettime( CLOCK_REALTIME, &ts );
+    std::string darkEnd = isoTime( ts );
+
+    // Always open the shutter again, even if stopped or on error
+    if( setShutter( false ) == 0 )
+    {
+        m_shutterShut = false;
+    }
+    else
+    {
+        logError( "THE " + m_sciDevice + " SHUTTER MAY STILL BE SHUT: check and open it" );
+        rv = -1;
+    }
+
+    if( rv != 0 )
+    {
+        return rv;
+    }
+
+    mx::improc::eigenImage<float> dark = ( sum / static_cast<double>( m_darkN ) ).cast<float>();
+
+    if( m_sciPreMax > 0 && dark.maxCoeff() > 0.5 * m_sciPreMax )
+    {
+        log( "warning: dark max " + std::to_string( dark.maxCoeff() ) + " is not far below the preflight max " +
+             std::to_string( m_sciPreMax ) + ": did the shutter close?" );
+    }
+
+    m_darkTaken = m_darkN;
+
+    mx::fits::fitsHeader<> head = outputHeader( true );
+    head.append( "PRODUCT", std::string( "dark: mean of NDARK frames with the shutter shut" ), "content of this cube" );
+    head.append( "DARKBEG", darkBeg, "UTC shutter confirmed shut" );
+    head.append( "DARKEND", darkEnd, "UTC last dark frame" );
+    head.append( "DARKDISC", m_darkDiscard, "frames discarded after the shutter shut" );
+
+    std::string               file = outputPath( "_" + m_sciName + "_dark.fits" );
+    mx::fits::fitsFile<float> ff;
+
+    if( ff.write( file, dark, head ) != mx::error_t::noerror )
+    {
+        logError( "could not write " + file );
+        m_darkTaken = 0;
+        return -1;
+    }
+
+    log( "wrote dark to " + file );
+
+    return 0;
+}
+
 inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
 {
     std::string seq;
@@ -1726,7 +2307,21 @@ inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
     head.append( "DMCOMB", m_dmComb, "combined DM stream" );
     head.append( "SCISTRM", m_sciName, "science camera stream" );
     head.append( "SCIFPS", m_sciFps, "measured sci frame rate [Hz]" );
+    head.append( "SCILINMX", m_sciLinearMax, "sci linearity limit [counts], 0 = off" );
+    head.append( "SCIPRMAX", m_sciPreMax, "sci max pixel in a preflight frame" );
+    head.append( "NNONLIN", m_nNonlin, "acquisitions with sci pixels above SCILINMX" );
     head.append( "SCITYPE", (int)m_sci.datatype(), "sci ImageStreamIO datatype" );
+    head.append( "INDI", m_indiEnable, "INDI state recorded, see _indi*.txt" );
+    head.append( "SCIDEV", m_sciDevice, "sci camera INDI device" );
+    if( std::isfinite( m_sciExptime ) ) // NaN cards can't be written
+    {
+        head.append( "SCIEXPT", m_sciExptime, "sci exposure time from INDI at start [s]" );
+    }
+    if( std::isfinite( m_sciEmgain ) )
+    {
+        head.append( "SCIEMGN", m_sciEmgain, "sci EM gain from INDI at start" );
+    }
+    head.append( "NDARK", m_darkTaken, "frames in the dark (_dark.fits), 0 = none" );
     head.append( "NSNAP", (int)m_snapNames.size(), "number of snapshot streams" );
 
     for( size_t j = 0; j < m_snapNames.size(); ++j )
@@ -1844,12 +2439,24 @@ inline int xlinqCal::writeOutput( bool final )
         writeCam( m_wfsNames[j], m_wfs[j]->products() );
     }
 
-    std::vector<std::string> colNames = {
-        "POKE", "REPEAT", "SIGN", "DMCNT0", "DMPROJ", "SCICNT0A", "SCICNT0B", "SCIN", "SCIMISS", "TSTART", "TEND" };
+    std::vector<std::string> colNames = { "POKE",
+                                          "REPEAT",
+                                          "SIGN",
+                                          "DMCNT0",
+                                          "DMPROJ",
+                                          "SCICNT0A",
+                                          "SCICNT0B",
+                                          "SCIN",
+                                          "SCIMISS",
+                                          "TSTART",
+                                          "TEND",
+                                          "SCIATIMA",
+                                          "SCIATIMB",
+                                          "SCIMAX" };
 
     for( size_t j = 0; j < m_wfs.size(); ++j )
     {
-        for( const char *f : { "CNT0A", "CNT0B", "N", "MISS", "TORN" } )
+        for( const char *f : { "CNT0A", "CNT0B", "N", "MISS", "TORN", "ATIMA", "ATIMB" } )
         {
             colNames.push_back( "W" + std::to_string( j ) + f );
         }

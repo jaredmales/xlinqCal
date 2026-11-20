@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -66,9 +67,20 @@ class simStream
     /// Mark the stream as being written.
     void setWrite();
 
-    /// Update counters and times, and post the semaphores.
+    /// Update counters and times, and post the semaphores. atime is the current time.
     void post();
+
+    /// Update counters and times with the given acquisition time, and post the semaphores.
+    void post( const timespec &atime /**< [in] the frame acquisition time (CLOCK_REALTIME, as MagAO-X cameras) */ );
 };
+
+/// The current CLOCK_REALTIME time.
+inline timespec realtimeNow()
+{
+    timespec ts;
+    clock_gettime( CLOCK_REALTIME, &ts );
+    return ts;
+}
 
 /// Simulator configuration.
 struct xlinqSimConfig
@@ -115,6 +127,11 @@ struct xlinqSimConfig
     double wfsLevel{ 1000 }; ///< camwfs mean level [counts].
 
     double sciLevel{ 500 }; ///< camsci1 mean level [counts].
+
+    double sciDark{ 100 }; ///< camsci1 level with the shutter shut [counts].
+
+    std::string shutterFile; ///< If set, a file holding the shutter state: content starting "On" means shut (as
+                             ///< MagAOX shutter.toggle). Read at the end of each camsci1 exposure.
 
     double wfsGain{ 50 }; ///< rms camwfs response to a 1 micron rms poke [counts].
 
@@ -242,6 +259,9 @@ class xlinqSim
 
     /// Get seconds since start.
     double elapsed() const;
+
+    /// True if the shutter file says the shutter is shut.
+    bool shutterShut() const;
 };
 
 inline simStream::~simStream()
@@ -294,6 +314,12 @@ inline void simStream::setWrite()
 inline void simStream::post()
 {
     ImageStreamIO_UpdateIm( &m_image );
+}
+
+inline void simStream::post( const timespec &atime )
+{
+    timespec at = atime;
+    ImageStreamIO_UpdateIm_atime( &m_image, &at );
 }
 
 inline xlinqSim::xlinqSim( const xlinqSimConfig &cfg ) : m_cfg( cfg )
@@ -549,7 +575,8 @@ inline void xlinqSim::wfsThreadExec()
             p[i] = static_cast<uint16_t>( std::clamp( std::lround( frame( i ) ), 0L, 65535L ) );
         }
 
-        m_wfs.post();
+        timespec wfsAtime = realtimeNow();
+        m_wfs.post( wfsAtime );
 
         // The modal coefficients are computed from each camwfs frame, as in the loop
         if( !m_cfg.modevalName.empty() )
@@ -560,7 +587,7 @@ inline void xlinqSim::wfsThreadExec()
                 {
                     return v + modeNorm( gen );
                 } );
-            m_modeval.post();
+            m_modeval.post( wfsAtime ); // cacao carries the camera atime through
         }
     }
 }
@@ -581,11 +608,12 @@ inline void xlinqSim::sciThreadExec()
     durT expTime   = std::chrono::duration_cast<durT>( std::chrono::duration<double>( 1.0 / m_cfg.sciFps ) );
     durT postDelay = std::chrono::duration_cast<durT>( std::chrono::duration<double>( m_cfg.sciPostDelay ) );
 
-    auto expStart = std::chrono::steady_clock::now();
-    auto next     = expStart;
-    auto postAt   = expStart;
-    bool pending  = false;
-    int  nSamp    = 0;
+    auto     expStart = std::chrono::steady_clock::now();
+    auto     next     = expStart;
+    auto     postAt   = expStart;
+    bool     pending  = false;
+    int      nSamp    = 0;
+    timespec pendingAtime{};
 
     while( m_run )
     {
@@ -604,7 +632,7 @@ inline void xlinqSim::sciThreadExec()
         {
             m_sci.setWrite();
             Eigen::Map<Eigen::ArrayXf>( m_sci.data<float>(), nPix ) = pendingFrame;
-            m_sci.post();
+            m_sci.post( pendingAtime ); // atime = end of exposure, as a camera timestamp
             pending = false;
         }
 
@@ -612,19 +640,45 @@ inline void xlinqSim::sciThreadExec()
         {
             float level = m_cfg.sciLevel * ( 1 + m_cfg.drift * ( elapsed() - 0.5 / m_cfg.sciFps ) );
 
-            pendingFrame = ( level + acc / nSamp )
-                               .unaryExpr(
-                                   [&]( float v )
-                                   {
-                                       return v + norm( gen );
-                                   } );
-            pending = true;
-            postAt  = next + postDelay;
+            if( shutterShut() )
+            {
+                pendingFrame = pendingFrame.unaryExpr(
+                    [&]( float )
+                    {
+                        return static_cast<float>( m_cfg.sciDark + norm( gen ) );
+                    } );
+            }
+            else
+            {
+                pendingFrame = ( level + acc / nSamp )
+                                   .unaryExpr(
+                                       [&]( float v )
+                                       {
+                                           return v + norm( gen );
+                                       } );
+            }
+            pending      = true;
+            pendingAtime = realtimeNow();
+            postAt       = next + postDelay;
             expStart += expTime;
             acc.setZero();
             nSamp = 0;
         }
     }
+}
+
+inline bool xlinqSim::shutterShut() const
+{
+    if( m_cfg.shutterFile.empty() )
+    {
+        return false;
+    }
+
+    std::ifstream fin( m_cfg.shutterFile );
+    std::string   state;
+    fin >> state;
+
+    return state.compare( 0, 2, "On" ) == 0;
 }
 
 inline double xlinqSim::elapsed() const

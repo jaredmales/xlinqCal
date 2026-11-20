@@ -7,3 +7,4 @@ tests/xlinqCal_test
 xlsim_*.fits
 try*/
 __pycache__/
+CMmodesDM.fits

@@ -131,6 +131,23 @@ class isioStream
     bool copy( mx::improc::eigenImage<realT> &im, /**< [out] the frame, resized as needed */
                uint64_t                      &cnt0 /**< [out] the frame counter of the copied frame */ );
 
+    /// Copy the current frame and its acquisition time, converting to realT.
+    /** As copy(im, cnt0), and also returns the frame's acquisition time (`atime`), which is set by the
+     * writer (for MagAO-X cameras, the frame timestamp). For a circular buffer the slice's atime is used
+     * when the atime array is present.
+     *
+     *
+eturns true if the copy is complete and untorn
+     *
+eturns false if the frame changed during the copy
+     *
+     * 	hrows std::runtime_error for unsupported datatypes
+     */
+    template <typename realT>
+    bool copy( mx::improc::eigenImage<realT> &im,   /**< [out] the frame, resized as needed */
+               uint64_t                      &cnt0, /**< [out] the frame counter of the copied frame */
+               timespec                      &atime /**< [out] the acquisition time of the copied frame */ );
+
     /// Copy a typed source array into a realT image.
     /** \throws std::runtime_error for unsupported datatypes
      */
@@ -230,6 +247,12 @@ inline timespec isioStream::writetime() const
     return m_image.md->writetime;
 }
 
+/// Convert a timespec to seconds.
+inline double tsSec( const timespec &ts /**< [in] the time */ )
+{
+    return ts.tv_sec + 1e-9 * ts.tv_nsec;
+}
+
 inline int isioStream::semIndex() const
 {
     return m_semIndex;
@@ -279,6 +302,14 @@ inline waitResult isioStream::wait( double timeout )
 template <typename realT>
 bool isioStream::copy( mx::improc::eigenImage<realT> &im, uint64_t &cnt0 )
 {
+    timespec atime{};
+
+    return copy( im, cnt0, atime );
+}
+
+template <typename realT>
+bool isioStream::copy( mx::improc::eigenImage<realT> &im, uint64_t &cnt0, timespec &atime )
+{
     size_t nr = rows();
     size_t nc = cols();
 
@@ -299,6 +330,12 @@ bool isioStream::copy( mx::improc::eigenImage<realT> &im, uint64_t &cnt0 )
                       slice * nr * nc * ImageStreamIO_typesize( m_image.md->datatype );
 
     copyTyped( im, src, m_image.md->datatype, nr, nc );
+
+    // Per-slice times are valid only for temporal circular buffers (as in MagAOX shmimMonitor)
+    bool fromArrays = m_image.md->naxis == 3 && m_image.md->size[2] > 1 && m_image.atimearray != nullptr &&
+                      ( m_image.md->imagetype & 0xF000F ) == ( CIRCULAR_BUFFER | ZAXIS_TEMPORAL );
+
+    atime = fromArrays ? m_image.atimearray[slice] : m_image.md->atime;
 
     return cnt0 == m_image.md->cnt0;
 }

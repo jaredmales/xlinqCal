@@ -323,7 +323,31 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
         {
             REQUIRE( fabs( rec[timingCol::dmProj] - 1 ) < 1e-4 );
         }
+
+        // Acquisition times: the averaged camsci1 exposures end inside the gate, one frame period apart
+        double t0 = rec[timingCol::tStart];
+        double t1 = rec[timingCol::tEnd];
+        double sa = rec[timingCol::sciAtimeFirst];
+        double sb = rec[timingCol::sciAtimeLast];
+        INFO( "gate " << t0 << "-" << t1 << " sci atime " << sa << "-" << sb );
+        REQUIRE( sa > t0 - 0.05 );
+        REQUIRE( sb <= t1 );
+        REQUIRE( fabs( ( sb - sa ) - ( nFrames - 1 ) / cfg.sciFps ) < 0.2 / cfg.sciFps );
+
+        // WFS frames fall inside the gate; modeval carries the camwfs atime
+        for( size_t j = 0; j < 2; ++j )
+        {
+            REQUIRE( rec[wfsColIndex( j, wfsCol::atimeFirst )] > t0 - 0.01 );
+            REQUIRE( rec[wfsColIndex( j, wfsCol::atimeLast )] <= t1 + 0.01 );
+            REQUIRE( rec[wfsColIndex( j, wfsCol::atimeLast )] > rec[wfsColIndex( j, wfsCol::atimeFirst )] );
+        }
+        REQUIRE( fabs( rec[wfsColIndex( 1, wfsCol::atimeFirst )] - rec[wfsColIndex( 0, wfsCol::atimeFirst )] ) <
+                 2.0 / cfg.wfsFps );
+
+        REQUIRE( rec[timingCol::sciMax] > cfg.sciLevel );
     }
+
+    REQUIRE( app.nNonlin() == 0 );
 
     // Rows: ref, + - - +, ref, ... The first ref and the second '-' need no DM write.
     REQUIRE( timing[0][timingCol::sign] == 0 );
@@ -426,6 +450,7 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
                                       "--out.dir=" + dir.string(),
                                       "--out.prefix=stop",
                                       "--snap.shmim=" + snapRef,
+                                      "--sci.linearMax=1",
                                       "--yes" };
 
     std::vector<char *> argv;
@@ -452,6 +477,14 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
     REQUIRE( app.nDone() > 0 );
     REQUIRE( app.nDone() < 15 );
 
+    // Every completed acquisition is above the (deliberately low) linearity limit
+    size_t nAcq = 0;
+    for( const timingRecord &rec : app.timing() )
+    {
+        nAcq += !std::isnan( rec[timingCol::sciMax] );
+    }
+    REQUIRE( app.nNonlin() == static_cast<int>( nAcq ) );
+
     REQUIRE( ( dm() - initial ).abs().maxCoeff() == 0 );
 
     mx::improc::eigenCube<float> wfsFile;
@@ -476,6 +509,276 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
     REQUIRE( snapIm( 3, 0 ) == 7 );
 
     dm.close();
+    sim.stop();
+    std::filesystem::remove_all( dir );
+}
+
+/// runCommand captures output and exit status, runs without a shell, and kills at the timeout.
+TEST_CASE( "runCommand captures output, status, and timeouts", "[indiClient]" )
+{
+    using namespace xlinqCal;
+
+    cmdResult r = runCommand( { "echo", "a b;c" }, 5 );
+    REQUIRE( r.status == 0 );
+    REQUIRE_FALSE( r.timedOut );
+    REQUIRE( r.out == "a b;c\n" ); // no shell: ';' is literal
+
+    r = runCommand( { "sh", "-c", "echo oops >&2; exit 3" }, 5 );
+    REQUIRE( r.status == 3 );
+    REQUIRE( r.err == "oops\n" );
+
+    auto t0   = std::chrono::steady_clock::now();
+    r         = runCommand( { "sleep", "5" }, 0.3 );
+    double dt = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+    REQUIRE( r.timedOut );
+    REQUIRE( r.status == -1 );
+    REQUIRE( dt < 2 );
+
+    r = runCommand( { "/nonexistent/xlsim_no_such_command" }, 5 );
+    REQUIRE( r.status == 127 );
+}
+
+/// INDI names are exact device.property[.element] with no wildcards or shell characters.
+TEST_CASE( "indiClient validates names", "[indiClient]" )
+{
+    using xlinqCal::indiClient;
+
+    REQUIRE( indiClient::validName( "camsci1.exptime", 1 ) );
+    REQUIRE( indiClient::validName( "camsci1.shutter_status.status", 2 ) );
+    REQUIRE( indiClient::validName( "fw-sci1.filter", 1 ) );
+    REQUIRE_FALSE( indiClient::validName( "camsci1", 1 ) );
+    REQUIRE_FALSE( indiClient::validName( "camsci1.exptime", 2 ) );
+    REQUIRE_FALSE( indiClient::validName( "camsci1.*", 1 ) );
+    REQUIRE_FALSE( indiClient::validName( "*.exptime", 1 ) );
+    REQUIRE_FALSE( indiClient::validName( "camsci1..exptime", 2 ) );
+    REQUIRE_FALSE( indiClient::validName( "camsci1.exptime.", 2 ) );
+    REQUIRE_FALSE( indiClient::validName( "cam sci1.exptime", 1 ) );
+    REQUIRE_FALSE( indiClient::validName( "camsci1.exptime;rm", 1 ) );
+}
+
+/// \cond
+namespace xlinqCalTest
+{
+
+/// Fake getINDI/setINDI scripts over a state directory of `device.property.element` files.
+/** setINDI requires a type flag and applies the new value after 0.3 s, like an asynchronous device.
+ * Calls are logged to getlog and setlog. Nothing here talks to an indiserver.
+ */
+struct fakeIndi
+{
+    std::filesystem::path dir;   ///< The base directory.
+    std::filesystem::path state; ///< The state directory.
+    std::string           getCmd;
+    std::string           setCmd;
+
+    explicit fakeIndi( const std::filesystem::path &base ) : dir( base ), state( base / "state" )
+    {
+        std::filesystem::create_directories( state );
+        getCmd = ( dir / "getINDI" ).string();
+        setCmd = ( dir / "setINDI" ).string();
+
+        std::ofstream g( getCmd );
+        g << "#!/bin/bash\n"
+             "S='"
+          << state.string()
+          << "'\n"
+             "spec=\"${@: -1}\"\n"
+             "echo \"$spec\" >> '"
+          << ( dir / "getlog" ).string()
+          << "'\n"
+             "found=0\n"
+             "for f in \"$S/$spec\".*; do [ -e \"$f\" ] || continue; echo \"$(basename \"$f\")=$(cat \"$f\")\"; "
+             "found=1; done\n"
+             "[ $found = 1 ] || { echo \"No $spec from localhost:7624\" >&2; exit 1; }\n";
+        g.close();
+
+        std::ofstream s( setCmd );
+        s << "#!/bin/bash\n"
+             "S='"
+          << state.string()
+          << "'\n"
+             "[ \"$1\" = -s ] || [ \"$1\" = -n ] || { echo 'untyped set' >&2; exit 1; }\n"
+             "arg=\"$2\"; dpe=\"${arg%%=*}\"; val=\"${arg#*=}\"\n"
+             "echo \"$1 $arg\" >> '"
+          << ( dir / "setlog" ).string()
+          << "'\n"
+             "( sleep 0.3; echo \"$val\" > \"$S/../tmp.$$\" && mv \"$S/../tmp.$$\" \"$S/$dpe\" ) >/dev/null 2>&1 &\n";
+        s.close();
+
+        std::filesystem::permissions( getCmd, std::filesystem::perms::owner_all );
+        std::filesystem::permissions( setCmd, std::filesystem::perms::owner_all );
+    }
+
+    void set( const std::string &dpe, const std::string &val )
+    {
+        std::ofstream( state / dpe ) << val << "\n";
+    }
+
+    std::string get( const std::string &dpe ) const
+    {
+        std::ifstream f( state / dpe );
+        std::string   v;
+        f >> v;
+        return v;
+    }
+
+    std::vector<std::string> lines( const std::string &log ) const
+    {
+        std::vector<std::string> out;
+        std::ifstream            f( dir / log );
+        std::string              l;
+        while( std::getline( f, l ) )
+        {
+            out.push_back( l );
+        }
+        return out;
+    }
+};
+
+} // namespace xlinqCalTest
+/// \endcond
+
+/// With INDI enabled, xlinqCal records camera state at start and end, takes a dark with the shutter
+/// shut after the run, and leaves the shutter open. All INDI calls are exact and type-flagged.
+TEST_CASE( "xlinqCal records INDI state and takes a dark", "[xlinqCal][integration][indi]" )
+{
+    using namespace xlinqCal;
+
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / ( xlinqCalTest::testPrefix() + "indi_out" );
+    std::filesystem::create_directories( dir );
+    xlinqCalTest::fakeIndi indi( dir / "indi" );
+
+    const std::string dev = "xlsimcam";
+    indi.set( dev + ".fsm.state", "READY" );
+    indi.set( dev + ".exptime.current", "0.05" );
+    indi.set( dev + ".exptime.target", "0.05" );
+    indi.set( dev + ".emgain.current", "1" );
+    indi.set( dev + ".fps.current", "20" );
+    indi.set( dev + ".shutter_status.status", "READY" );
+    indi.set( dev + ".shutter.toggle", "Off" );
+
+    xlinqSimConfig cfg;
+    cfg.prefix       = xlinqCalTest::testPrefix() + "indi_";
+    cfg.dmChannel    = cfg.prefix + "dm01disp04";
+    cfg.dmComb       = cfg.prefix + "dm01disp";
+    cfg.wfsName      = cfg.prefix + "camwfs";
+    cfg.sciName      = cfg.prefix + "camsci1";
+    cfg.wfsFps       = 1000;
+    cfg.sciFps       = 20;
+    cfg.sciPostDelay = 0.015;
+    cfg.shutterFile  = ( indi.state / ( dev + ".shutter.toggle" ) ).string();
+
+    mx::improc::eigenCube<float> pokes    = xlinqSim::randomPokes( cfg.dmRows, cfg.dmCols, 2, 3 );
+    std::string                  pokeFile = ( dir / "pokes.fits" ).string();
+    mx::fits::fitsFile<float>    ff;
+    REQUIRE( ff.write( pokeFile, pokes ) == mx::error_t::noerror );
+
+    xlinqSim sim( cfg );
+    sim.start();
+
+    auto runApp = [&]( const std::string &prefix, std::vector<std::string> extra )
+    {
+        std::vector<std::string> args = { "xlinqCal",
+                                          "--dm.channel=" + cfg.dmChannel,
+                                          "--dm.comb=" + cfg.dmComb,
+                                          "--sci.shmim=" + cfg.sciName,
+                                          "--wfs.shmim=" + cfg.wfsName,
+                                          "--poke.file=" + pokeFile,
+                                          "--poke.amp=0.1",
+                                          "--sci.nFrames=2",
+                                          "--preflight.time=0.3",
+                                          "--out.dir=" + dir.string(),
+                                          "--out.prefix=" + prefix,
+                                          "--indi.enable=true",
+                                          "--indi.get=" + indi.getCmd,
+                                          "--indi.set=" + indi.setCmd,
+                                          "--indi.poll=0.2",
+                                          "--sci.device=" + dev,
+                                          "--yes" };
+        args.insert( args.end(), extra.begin(), extra.end() );
+
+        std::vector<char *> argv;
+        for( std::string &a : args )
+        {
+            argv.push_back( a.data() );
+        }
+
+        xlinqCal::xlinqCal app;
+        int                rv = app.main( argv.size(), argv.data() );
+        return std::make_pair( rv, app.nDone() );
+    };
+
+    SECTION( "complete run with a dark" )
+    {
+        auto [rv, nDone] = runApp( "indi", { "--dark.n=3", "--indi.props=" + dev + ".missing" } );
+        REQUIRE( rv == 0 );
+        REQUIRE( nDone == 2 );
+
+        // State files: camera properties at start and end, with the unreadable one noted
+        std::ifstream     fin( dir / "indi_indi.txt" );
+        std::stringstream ss;
+        ss << fin.rdbuf();
+        REQUIRE( ss.str().find( dev + ".exptime.current=0.05" ) != std::string::npos );
+        REQUIRE( ss.str().find( dev + ".shutter.toggle=Off" ) != std::string::npos );
+        REQUIRE( ss.str().find( "# " + dev + ".missing:" ) != std::string::npos );
+        REQUIRE( std::filesystem::exists( dir / "indi_indi_end.txt" ) );
+
+        // The dark is the shut level, not the open level
+        mx::improc::eigenImage<float> dark;
+        mx::fits::fitsHeader<>        dhead;
+        REQUIRE( ff.read( dark, dhead, ( dir / ( "indi_" + cfg.sciName + "_dark.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        REQUIRE( dark.mean() == Approx( cfg.sciDark ).margin( 2 ) );
+        REQUIRE( dhead["NDARK"].value<int>() == 3 );
+
+        mx::improc::eigenCube<float> resp;
+        mx::fits::fitsHeader<>       head;
+        REQUIRE( ff.read( resp, head, ( dir / ( "indi_" + cfg.sciName + "_resp.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        REQUIRE( head["SCIEXPT"].value<double>() == Approx( 0.05 ) );
+        REQUIRE( head["NDARK"].value<int>() == 3 );
+
+        // The shutter is open again, and was commanded shut then open with typed sets
+        REQUIRE( indi.get( dev + ".shutter.toggle" ) == "Off" );
+        std::vector<std::string> sets = indi.lines( "setlog" );
+        REQUIRE( sets.size() == 2 );
+        REQUIRE( sets[0] == "-s " + dev + ".shutter.toggle=On" );
+        REQUIRE( sets[1] == "-s " + dev + ".shutter.toggle=Off" );
+
+        // Every get was one exact device.property
+        for( const std::string &g : indi.lines( "getlog" ) )
+        {
+            INFO( g );
+            REQUIRE( indiClient::validName( g, 1 ) );
+        }
+    }
+
+    SECTION( "refuses to start with the shutter shut" )
+    {
+        indi.set( dev + ".shutter.toggle", "On" );
+        auto [rv, nDone] = runApp( "shut", { "--dark.n=3" } );
+        REQUIRE( rv == -1 );
+        REQUIRE( nDone == 0 );
+        REQUIRE( indi.lines( "setlog" ).empty() );
+    }
+
+    SECTION( "refuses a dark when the shutter is not ready" )
+    {
+        indi.set( dev + ".shutter_status.status", "POWEROFF" );
+        auto [rv, nDone] = runApp( "notready", { "--dark.n=3" } );
+        REQUIRE( rv == -1 );
+        REQUIRE( nDone == 0 );
+        REQUIRE( indi.lines( "setlog" ).empty() );
+    }
+
+    SECTION( "a dark needs indi.enable" )
+    {
+        auto [rv, nDone] = runApp( "noindi", { "--dark.n=3", "--indi.enable=false" } );
+        REQUIRE( rv == -1 );
+        REQUIRE( nDone == 0 );
+        REQUIRE( indi.lines( "getlog" ).empty() );
+    }
+
     sim.stop();
     std::filesystem::remove_all( dir );
 }
