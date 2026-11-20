@@ -293,3 +293,69 @@ Data set `try1/xlinqCal_20261119_001`: 2400 Fourier modes, amp 0.05 µm rms, cam
 - A separate WFS-only calibration loses the simultaneous WFS and camsci1 measurement.
 
 Time savings must come from amplitude shaping and the choice of `nFrames` and `nRepeat`.
+
+### 9.11 Goal restated: the ideal-coronagraph speckle field (2026-11-20)
+**User:** the goal of the |S|² calibration is to predict the speckle pattern the ideal coronagraph would give (mxlib `wfp/idealCoronagraph.hpp`), even though that coronagraph can't be built. The calibration measures the WFS → focal-plane map for the ideal coronagraph. **Primary use:** predict the speckle field **without the quasi-statics**, as a post-processing basis. Calibrating the quasi-static field is a secondary interest.
+
+**The ideal coronagraph and the ± products.** `idealCoronagraph::propagate` computes $E_{\rm out} = P\,(E - \langle E\rangle_P)$. With $E = P e^{i\varphi}$ and $\varphi = \varphi_0 + \delta\varphi$, to second order:
+$$E - \langle E\rangle \approx i(\varphi - \langle\varphi\rangle) - \tfrac12(\varphi^2 - \langle\varphi^2\rangle).$$
+The focal intensity is $|\mathcal F\{P\, i(\varphi-\langle\varphi\rangle)\}|^2 + O(\varphi^4)$, so the mean field $C$ cancels. Mapped onto the measured terms:
+
+| Measured term | In the ideal coronagraph |
+|---|---|
+| $\lvert S_k\rvert^2$ (even part) | kept: the target |
+| odd part $2\,\mathrm{Re}(C^*S_k)$ | absent |
+| halo dimming $-\varepsilon\lvert C\rvert^2$ (even part, §9.10) | removed: it is the $-\tfrac12\langle\varphi^2\rangle$ (Strehl loss) term. The $\varepsilon\cdot$ref correction is exactly the conversion to the ideal coronagraph. |
+| $2\,\mathrm{Re}(C^*S_2)$ at $\pm 2f$ (single mode) or $f_a \pm f_b$ (probes) | removed. It appears only as $\lvert S_2\rvert^2 = O(a^4)$. |
+| pupil mean of the mode, $a\langle m_k\rangle_P\,A$ in $S_k$ ($A = \mathcal F\{P\}$) | removed (the $-\langle\varphi\rangle$ term). $\langle m_k\rangle_P \approx 2J_1(x)/x$ with $x = \pi D|n|/50$: about 20% of the mode rms at $|n| = 1$, a few % by $|n| \approx 5$. |
+
+**Consequences:**
+- **Calibrate without a focal-plane coronagraph, with the science pupil in.** In the ideal coronagraph an off-axis speckle passes unchanged ($S_k = \mathcal F\{P\,i a m_k'\}$, the non-coronagraphic field). A real Lyot coronagraph attenuates near the IWA and changes $\mathbf G$. try2 (bump mask in, no FPM) is the right configuration. $P$ in any model is the bump-mask pupil.
+- **The field-form model (approach 1, complex $\mathbf G$) is the main path.** The ideal coronagraph is a linear projection on the field, $\mathbf G_{\rm ideal} = \mathbf G - A\,\langle \mathbf m\rangle_P^\top$. A fitted $\mathbf G$ can be converted exactly, and the dimming and $2f$ terms are modeled explicitly. Regression on even-part intensities (approaches 2, LinQ) learns the non-ideal terms and can't remove them afterward, so those become baselines.
+- **Science data through the real coronagraph:** the ideal basis differs from what the real coronagraph passes near the IWA by the coronagraph's off-axis transfer. Either apply a measured throughput map, or calibrate a second $\mathbf G$ with the coronagraph in and compare.
+
+**Predicting the speckle field without the quasi-statics.** Write $z_t = \bar z_j + \delta z_t$, with $\bar z_j$ the mean over science exposure $j$. Then the exposure-$j$ intensity is, to second order in the random part:
+$$\langle I\rangle_j = |C_j'|^2 + \langle|\mathbf G\,\delta z_t|^2\rangle_j + 2\,\mathrm{Re}\big(C_j'^{\,*}\,\mathbf G\,\langle\delta z_t\rangle_j\big),$$
+where $C_j' = C' + \mathbf G\bar z_j$ is the quasi-static field during the exposure (NCPA plus the slow WFS-seen part). The pinned term vanishes because $\langle \delta z_t\rangle_j = 0$ by construction. So the predicted random halo $\langle|\mathbf G_{\rm ideal}\,\delta z_t|^2\rangle_j$ needs **only $\mathbf G$, not $C$**. Everything slower than the exposure goes into $|C_j'|^2$ and is left to ADI/RDI. Notes:
+- The split depends on the exposure. A longer exposure moves more of the slow WFS-seen part into $\delta z$.
+- The prediction is first order in the field. The $|S_2|^2$ and higher terms are small at the residual levels of a closed loop and are checked on the test probes (§9.7).
+- The WFS's own nonlinearity enters through $z_t$ (§9.6). try2 showed the low-order WFS response at 0.05 µm (try1) was compressed by 15–20%, so calibrate near the amplitudes the science residuals have.
+
+**Calibrating the quasi-static field (secondary).** The odd parts are pairwise probes. For each mode, $\tfrac12[I(+) - I(-)] = 2\,\mathrm{Re}(C^*S_k)$. For a cos/sin pair at the same $f$, the two fields at the speckle position are in quadrature, so the two odd parts give both quadratures of $C$ there. With $\mathbf G$ known (approach 1), the full set gives the complex $C$ at every pixel of the control region. That is 2400 equations per pixel for one complex unknown, the same estimator as pairwise-probe focal-plane sensing. Products:
+- $C$ (complex) over the control region during the run, and how it changes, from blocks of odd parts across the ~15 min run.
+- $|C|^2$ every ~0.3 s from the interleaved references.
+- With the WFS reference snapshot and $\bar z$: the part of $C$ the WFS doesn't see (NCPA) versus the part it does.
+- With a coronagraph in, the same analysis estimates the dark-hole field.
+
+**Open check:** the even parts should show the predicted $2\,\mathrm{Re}(C^*S_2)$ feature at $\pm 2f$ for low-order modes, where $C$ is bright. Finding it, with the right sign and amplitude ($\propto a^2$), tests the second-order picture.
+
+### 9.12 Tests of the second-order picture and the quadrature field estimate (2026-11-20)
+Tools: `tools/test_2f.py` and `tools/quadrature_field.py` (shared helpers in `tools/xlq_fourier.py`). Data: try1 (0.05 µm, `nFrames=2`) and try2 (shaped amplitudes, `nFrames=1`, bump mask in).
+
+**Mode phases.** `modFourier_48.fits` is a modified Fourier basis: pure sinusoids $\sqrt2\cos(\psi+\theta_k)$, masked to the 2039 active actuators and normalized there. The fit residual is $<10^{-5}$, and each frequency has exactly two modes in quadrature (phase difference π/2 to $10^{-6}$). So every frequency is a cos/sin probe pair with known phases.
+
+**Second-order (2f) test.** For mode $k$ at $f$, the second-order field $-\varphi^2/2$ has a component $-(\kappa a_k)^2/4\,e^{\pm 2i\theta_k} A(\xi\mp 2f)$ at $\pm 2f$. Its interference with $C$ is predicted pixel by pixel from the odd parts of the cos/sin pair at $2f$, which have the same $A(\xi\mp2f)$ shape. The fit is even$_k = \kappa\cdot$pred, plus nuisance terms (halo dimming, the mode's own speckle, the $|S_2|^2$ ghost, a constant), over ≈ 1200 mode-sides with $|n|$ ≈ 3–17. κ = rad of phase per µm of DM command.
+
+| Estimate of κ [rad/µm] | try2 | try1 |
+|---|---|---|
+| cross term $2\,\mathrm{Re}(C^*S_2)$ | 8.4 ± 1.7, χ²/dof 1.07; 11.9 ± 2.3 corrected for noise dilution (reliability 0.71) | 9.3 ± 0.5 at $\lvert n\rvert$ 3–4; 3.9–6.4 at $\lvert n\rvert$ 4–12 (χ²/dof 4.8) |
+| $\lvert S_2\rvert^2$ ghost at 2f ($\kappa^4a^4/16 \times$ PSF) | not detected (amplitude too small) | 8.31 ± 0.01 (statistical) |
+| speckle energy, $\sqrt{E/a^2}$ (aperture-limited) | ≈ 10–11 | ≈ 9 |
+
+- **try2 confirms the second-order picture quantitatively:** same sign on both sides, consistent χ², and a magnitude that matches the first-order speckle energy. The dimming and 2f terms can be modeled with a measured κ.
+- **try1 is only partly consistent.** At 0.05 µm (κa ≈ 0.45 rad) higher-order terms matter, consistent with the WFS compression seen in try2.
+- **Twin orientation:** the sign of κ fixes which speckle of a pair carries $e^{+i\psi}$. It is at $c - M n$, with M normalized to a positive trace (`--side-sign -1`), on both data sets. A phase-retrieval fit of $\mathbf G$ (approach 1) must use this convention.
+- **Units (to confirm):** κ ≈ 10–12 rad/µm means λ ≈ 0.55–0.63 µm if DM commands are wavefront µm, or ≈ 1.1–1.25 µm if surface µm.
+
+**Quadrature estimate of C.** At each speckle peak, $C = \overline{Z}/(2\sqrt{e})$ from the pair's odd parts and even parts (no κ needed). The coherent fraction $R = |C|^2/\mathrm{ref}$ is independent of phase conventions, since $|Z|^2 = o_{\cos}^2 + o_{\sin}^2$.
+- cos and sin agree on speckle intensity to < 0.1% (median).
+- **try2:** R ≈ 0.71–0.77 out to 130 px.
+- **try1:** R ≈ 0.6 within 12 px, falling to 0.3 at 30–65 px and 0.2 beyond 90 px.
+- About 0.8 of try1's lower R is expected from its large amplitude ($J_0^2$). The rest is unexplained: the reference fluctuations are similar in both runs. Candidates are a filter or bandwidth difference, and partial coherence. In both runs, ≈ 25% or more of the reference light doesn't interfere with the probes. That light is not part of $C$ for the pinned term, and it is part of what the probes can't calibrate.
+
+**Pupil field.** $C(n)$ on the frequency lattice, inverse-FFT'd on the actuator grid with the n = 0 term fitted (field zero outside the pupil and in the obscuration), gives the pupil-plane field in DM coordinates:
+- **Geometry:** the Magellan pupil, ≈ 46 actuators across (half max), obscuration ≈ 15 actuators, four spiders, centered at actuator (24.3, 24.5) in try1 and (24.2, 24.8) in try2.
+- **Phase:** the quasi-static aberration seen by camsci1 is 0.19 rad rms in try1. try2 is 0.34 rad rms, inflated by spider-edge pixels, and differs from try1 by ≈ 0.23 rad rms in a smooth pattern.
+- **Bump mask:** not resolved at one-actuator sampling.
+- **Uses:** $P$ for the $\mathbf G$ model and the ideal coronagraph (§9.11); the DM-to-pupil registration; and "cycles per aperture" = $0.92\,n$ (10 cpa ≈ $n$ = 10.9).
+- **Every run gives a quasi-static field estimate** at no extra cost.
