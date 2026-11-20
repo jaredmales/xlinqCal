@@ -65,6 +65,16 @@ In `out.dir`, with prefix `out.prefix` (default `xlinqCal_<UTC>`):
 python3 tools/shape_pokes.py --modes modFourier_48.fits --data try1/xlinqCal_20261119_001 --out modFourier_48_shaped.fits
 ```
 
+`tools/quadrature_field.py` uses each Fourier frequency's cos/sin mode pair as pairwise probes. The two odd parts give both quadratures of the coherent field C at the speckle, so it estimates C at every speckle peak with no DM gain needed. It prints the coherent fraction |C|²/ref by radius. It also inverse-transforms the C lattice into the pupil-plane field on the actuator grid, giving the pupil registered on the DM (amplitude) and the quasi-static phase seen by camsci1. It writes a FITS file with the field and a table of per-speckle results, plus an optional PNG.
+
+`tools/test_2f.py` tests the second-order model. It predicts each low-order mode's even part at ±2f from the odd parts of the mode pair at 2f; the only free parameter is κ, in rad per µm of DM command. It reports κ, its consistency between the two sides, and κ from the |S₂|² ghost speckle. A negative κ means `--side-sign` (which speckle of a pair carries e^{+iψ}) is the twin. Both tools share `tools/xlq_fourier.py`.
+
+```
+python3 tools/test_2f.py --modes modFourier_48.fits --data try2/xlinqCal_20261119_002
+python3 tools/quadrature_field.py --modes modFourier_48.fits --data try2/xlinqCal_20261119_002 \
+    --out try2/field.fits --png try2/field.png
+```
+
 ## Building and testing
 
 Requires mxlib (built with MILK support), ImageStreamIO, and cfitsio, found via `pkg-config mxlib`.
