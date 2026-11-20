@@ -334,24 +334,42 @@ Tools: `tools/test_2f.py` and `tools/quadrature_field.py` (shared helpers in `to
 
 **Mode phases.** `modFourier_48.fits` is a modified Fourier basis: pure sinusoids $\sqrt2\cos(\psi+\theta_k)$, masked to the 2039 active actuators and normalized there. The fit residual is $<10^{-5}$, and each frequency has exactly two modes in quadrature (phase difference π/2 to $10^{-6}$). So every frequency is a cos/sin probe pair with known phases.
 
-**Second-order (2f) test.** For mode $k$ at $f$, the second-order field $-\varphi^2/2$ has a component $-(\kappa a_k)^2/4\,e^{\pm 2i\theta_k} A(\xi\mp 2f)$ at $\pm 2f$. Its interference with $C$ is predicted pixel by pixel from the odd parts of the cos/sin pair at $2f$, which have the same $A(\xi\mp2f)$ shape. The fit is even$_k = \kappa\cdot$pred, plus nuisance terms (halo dimming, the mode's own speckle, the $|S_2|^2$ ghost, a constant), over ≈ 1200 mode-sides with $|n|$ ≈ 3–17. κ = rad of phase per µm of DM command.
+**Second-order (2f) test.** For mode $k$ at $f$, the second-order field $-\varphi^2/2$ has a component $-(\kappa a_k)^2/4\,e^{\pm 2i\theta_k} A(\xi\mp 2f)$ at $\pm 2f$. Its interference with $C$ is predicted pixel by pixel from the odd parts of the cos/sin pair at $2f$, which have the same $A(\xi\mp2f)$ shape. κ = rad of phase per µm of DM command. The DM is nonlinear, especially at high spatial frequency, because of actuator coupling (user). That adds a real 2f surface, $\gamma a^2\cos(2\psi+2\theta_k)$, which by symmetry is aligned with $\cos^2$, so its speckle field is in **quadrature** with the optical term and gets its own regressor. Within one window the two regressors are nearly collinear, because arg Z varies little over a speckle. The fit therefore:
+- projects out the nuisance terms per window (halo dimming, the mode's own speckle, the $|S_2|^2$ ghost, a constant);
+- fits (κ, γ) jointly over all ≈ 1200 windows ($|n|$ ≈ 3–17);
+- subtracts the known noise variance from the normal matrix;
+- takes errors by bootstrap over windows.
 
-| Estimate of κ [rad/µm] | try2 | try1 |
+The earlier per-window weighted means had errors too small by ≈ 3–5× (correlated pixels), so the numbers below supersede them.
+
+| Estimate | try2 | try1 |
 |---|---|---|
-| cross term $2\,\mathrm{Re}(C^*S_2)$ | 8.4 ± 1.7, χ²/dof 1.07; 11.9 ± 2.3 corrected for noise dilution (reliability 0.71) | 9.3 ± 0.5 at $\lvert n\rvert$ 3–4; 3.9–6.4 at $\lvert n\rvert$ 4–12 (χ²/dof 4.8) |
-| $\lvert S_2\rvert^2$ ghost at 2f ($\kappa^4a^4/16 \times$ PSF) | not detected (amplitude too small) | 8.31 ± 0.01 (statistical) |
-| speckle energy, $\sqrt{E/a^2}$ (aperture-limited) | ≈ 10–11 | ≈ 9 |
+| κ, cross term $2\,\mathrm{Re}(C^*S_2)$ [rad/µm] | **14.1 ± 3.2** (sides 9.6 ± 4.7, 18.0 ± 4.6) | 7.7 ± 1.2 (9.4 ± 1.9 at $\lvert n\rvert$ 3–4) |
+| γ, DM 2f surface [µm⁻¹] | 0.3 ± 0.8 (2f/fundamental < 2% at a ≈ 0.014 µm) | −0.4 ± 0.5 overall; −1.2 ± 0.6 at $\lvert n\rvert$ 8–12, −2.3 ± 1.8 at 12–17 (2f/fundamental ≈ −4% to −8% at 0.05 µm, ~2σ) |
+| κ from the $\lvert S_2\rvert^2$ ghost | not detected | 8.1 (statistical error 0.01) |
+| κ from the speckle energy, $\sqrt{(E/a^2)/0.62}$ | ≈ 13.4 | ≈ 12.3; ≈ 13.8 with the $J_1$ saturation correction |
 
-- **try2 confirms the second-order picture quantitatively:** same sign on both sides, consistent χ², and a magnitude that matches the first-order speckle energy. The dimming and 2f terms can be modeled with a measured κ.
-- **try1 is only partly consistent.** At 0.05 µm (κa ≈ 0.45 rad) higher-order terms matter, consistent with the WFS compression seen in try2.
+- **try2 confirms the second-order picture quantitatively.** κ = 14.1 ± 3.2 rad/µm matches $4\pi/\lambda$ = 13.8 for surface-µm commands at z-band, and both sides agree. The dimming and 2f terms can be modeled with this κ.
+- **DM 2f harmonic:**
+  - not detected at try2 amplitudes;
+  - try1 hints (~2σ) at a negative harmonic growing with $|n|$, a few % of the fundamental at 0.05 µm for $|n| \gtrsim 8$, consistent with coupling nonlinearity.
+  - The 2f test can't see odd-order DM nonlinearity, which changes the gain at $f$ with amplitude: $T(n, a)$.
+- **The DM nonlinearity mostly drops out of the model.** The model input is the WFS-measured $z$ (`modevalWFS`), not the command. The WFS and camsci1 both see the actual surface, including any harmonic or gain compression. To use that, fit $\mathbf G$ on the per-sign states $(z_\pm, I_\pm)$, i.e. mean ± resp for both streams, rather than assuming $z = a\,e_k$ or using odd parts alone. The command amplitude then matters only for which actual amplitudes are probed.
+- **try1 is only partly consistent** (κ ≈ 7.7 vs 13.8). At 0.05 µm (κa ≈ 0.69 rad) higher-order terms matter, consistent with the WFS compression seen in try2.
 - **Twin orientation:** the sign of κ fixes which speckle of a pair carries $e^{+i\psi}$. It is at $c - M n$, with M normalized to a positive trace (`--side-sign -1`), on both data sets. A phase-retrieval fit of $\mathbf G$ (approach 1) must use this convention.
-- **Units (to confirm):** κ ≈ 10–12 rad/µm means λ ≈ 0.55–0.63 µm if DM commands are wavefront µm, or ≈ 1.1–1.25 µm if surface µm.
+- **Units (user):** DM commands are µm of **surface**, and camsci1 was in z-band (λ ≈ 0.91 µm) for both try1 and try2, so the filter is not a difference between the runs. The expected gain is $\kappa = 4\pi/\lambda$ = 13.8 rad/µm at low order:
+  - The try2 cross term gives 14.1 ± 3.2 (joint fit below).
+  - The speckle energy gives $\kappa \approx \sqrt{(E/a^2)/0.62} \approx 13.4$, where 0.62 is the PSF fraction inside the 6 px aperture.
+  - try1's E/a² gives ≈ 12.3. Correcting for the $J_1$ saturation at its amplitude gives ≈ 13.8.
+  - At higher $|n|$ the effective gain also includes the DM's influence-function transfer $T(n)$, so the 2f fit measures $\kappa\,T(n)^2/T(2n)$. The falloff of E/a² with $|n|$ mixes $T(n)$ with broadband (z-band) radial smearing of the speckles.
+- **Amplitudes in phase:** 0.05 µm surface = **0.69 rad rms** of wavefront at 0.91 µm. So try1's low-order pokes were strongly nonlinear: $x = \kappa a\sqrt2 \approx 0.98$ and $J_0^2(x) \approx 0.61$. try2's low-order amplitude, 0.0104 µm, is 0.14 rad rms ($J_0^2 \approx 0.98$). The shaping target of "1%" is the energy inside the aperture; the full speckle energy is ≈ 2% ($\sigma^2$ = 0.021).
+- **Plate scale:** 4.35–4.43 px per cycle/50 actuators × 50/46 gives ≈ 4.7–4.8 px per λ/D at 0.91 µm, consistent with the 4.8 px/(λ/D) assumed in §9.4.
 
 **Quadrature estimate of C.** At each speckle peak, $C = \overline{Z}/(2\sqrt{e})$ from the pair's odd parts and even parts (no κ needed). The coherent fraction $R = |C|^2/\mathrm{ref}$ is independent of phase conventions, since $|Z|^2 = o_{\cos}^2 + o_{\sin}^2$.
 - cos and sin agree on speckle intensity to < 0.1% (median).
 - **try2:** R ≈ 0.71–0.77 out to 130 px.
 - **try1:** R ≈ 0.6 within 12 px, falling to 0.3 at 30–65 px and 0.2 beyond 90 px.
-- About 0.8 of try1's lower R is expected from its large amplitude ($J_0^2$). The rest is unexplained: the reference fluctuations are similar in both runs. Candidates are a filter or bandwidth difference, and partial coherence. In both runs, ≈ 25% or more of the reference light doesn't interfere with the probes. That light is not part of $C$ for the pinned term, and it is part of what the probes can't calibrate.
+- **try1's lower R is mostly its amplitude:** with κ = 13.8 rad/µm, the low-order pokes at 0.05 µm multiply C by $J_0(x)$, so $J_0^2 \approx 0.61$ and the expected R is ≈ 0.61 × 0.75 ≈ 0.45. That matches try1's 0.41–0.44 at 12–30 px. The further decline beyond 30 px is unexplained: higher-|n| modes have smaller effective amplitudes ($T(n)$), which should raise R, not lower it. In both runs, ≈ 25% or more of the reference light doesn't interfere with the probes. That light is not part of $C$ for the pinned term, and it is part of what the probes can't calibrate.
 
 **Pupil field.** $C(n)$ on the frequency lattice, inverse-FFT'd on the actuator grid with the n = 0 term fitted (field zero outside the pupil and in the obscuration), gives the pupil-plane field in DM coordinates:
 - **Geometry:** the Magellan pupil, ≈ 46 actuators across (half max), obscuration ≈ 15 actuators, four spiders, centered at actuator (24.3, 24.5) in try1 and (24.2, 24.8) in try2.
