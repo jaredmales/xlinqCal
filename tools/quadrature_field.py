@@ -14,6 +14,11 @@ which needs no kappa (the DM-to-phase gain). Outputs:
   missing n = 0 (core) term fitted so the field is zero outside the pupil and in the obscuration.
   Amplitude shows the pupil registered on the DM; phase is the quasi-static aberration seen by camsci1.
 
+With a focal-plane mask (--fit-center), the optical axis is fitted from the speckles, speckles whose
+even part is below --min-snr (e.g. behind a knife edge) are dropped, and the pupil field is
+reconstructed only if both speckles of at least 90% of the pairs are visible. R is then the coherent
+fraction of the coronagraphic residual.
+
 The phase orientation (which speckle of a pair is e^{+i psi}) is set by --side-sign; the 2f test
 (tools/test_2f.py) measures it. With the wrong sign the pupil field is conj(E(-x)) (the twin image).
 
@@ -39,6 +44,8 @@ def main():
                     help="e^{+i psi} speckle at c + side_sign*M@n; -1 was measured on try1/try2")
     ap.add_argument("--out", required=True, help="output FITS file")
     ap.add_argument("--png", help="optional PNG of the pupil amplitude and phase")
+    ap.add_argument("--fit-center", action="store_true", help="fit the optical axis (focal-plane mask in)")
+    ap.add_argument("--min-snr", type=float, default=5.0, help="minimum even-part SNR of a speckle (with --fit-center)")
     args = ap.parse_args()
 
     modes = xf.load_modes(args.modes)
@@ -47,8 +54,8 @@ def main():
         raise ValueError("modes are not cos/sin pairs of pure sinusoids")
 
     d = xf.load_set(args.data, modes, args.sci)
-    M, gres, ngood = xf.geometry(d, n)
-    resp, even, mref, amp, c, sig = d["resp"], d["even"], d["mref"], d["amp"], d["c"], d["sig"]
+    M, gres, ngood = xf.geometry(d, n, fit_center=args.fit_center)
+    resp, even, mref, amp, c, sig, esig = (d[k] for k in ("resp", "even", "mref", "amp", "c", "sig", "esig"))
     ny, nx = mref.shape
 
     pts = []
@@ -65,6 +72,9 @@ def main():
             y, x = y0 - 2 + dy, x0 - 2 + dx
             Z = xf.solve_Z(resp[k1, y, x] / amp[k1], resp[k2, y, x] / amp[k2], th[k1], th[k2], s)
             e = 0.5 * (even[k1, y, x] / amp[k1] ** 2 + even[k2, y, x] / amp[k2] ** 2)
+            esn = e / (0.5 * np.hypot(esig[k1] / amp[k1] ** 2, esig[k2] / amp[k2] ** 2))
+            if args.fit_center and esn < args.min_snr:
+                continue
             bias = (sig[k1] / amp[k1]) ** 2 + (sig[k2] / amp[k2]) ** 2
             C = np.conj(Z) / (2 * np.sqrt(max(e, 1e-12)))
             Rc = (abs(Z) ** 2 - bias) / (4 * e * mref[y, x]) if mref[y, x] > 0 and e > 0 else np.nan
@@ -74,8 +84,8 @@ def main():
 
     r, Rc = pts[:, 4], pts[:, 10]
     snr = np.sqrt((pts[:, 5] ** 2 + pts[:, 6] ** 2) * 4 * pts[:, 7] / pts[:, 8])
-    print(f"PSF center ({c[0]:.2f}, {c[1]:.2f}); geometry from {ngood} modes, residual {gres:.2f} px; "
-          f"{len(pts)} speckles")
+    print(f"{'optical axis (fitted)' if args.fit_center else 'PSF center'} ({c[0]:.2f}, {c[1]:.2f}); geometry from "
+          f"{ngood} speckles, residual {gres:.2f} px; {len(pts)} speckles used")
     print(" radius [px] |    N | ref [counts] | |Z| SNR | coherent fraction R: median [IQR]")
     for lo, hi in [(0, 12), (12, 20), (20, 30), (30, 45), (45, 65), (65, 90), (90, 130), (130, 170)]:
         m = (r >= lo) & (r < hi)
@@ -83,6 +93,20 @@ def main():
             q = np.nanpercentile(Rc[m], [25, 50, 75])
             print(f"   {lo:3d}-{hi:<4d} | {m.sum():4d} | {np.median(pts[m, 9]):12.1f} | {np.median(snr[m]):7.1f} | "
                   f"{q[1]:.3f} [{q[0]:.3f}, {q[2]:.3f}]")
+
+    keys = {(int(a), int(b)) for a, b in pts[:, :2]}
+    both = np.mean([(-a, -b) in keys for a, b in keys])
+    if both < 0.9:
+        print(f"only {100 * both:.0f}% of the speckles have their twin visible: no pupil field")
+        hdr = fits.Header()
+        hdr["SRCDATA"] = (args.data.split("/")[-1], "xlinqCal data set")
+        hdr["SIDESGN"] = (args.side_sign, "e^{+i psi} speckle at c + SIDESGN*M@n")
+        hdr["CX"], hdr["CY"] = (c[0], "optical axis x [px]"), (c[1], "optical axis y [px]")
+        for (i, j), v in np.ndenumerate(M):
+            hdr[f"GEOM{i}{j}"] = (v, "camsci1 px = GEOM @ (n_x, n_y)")
+        fits.HDUList([fits.PrimaryHDU(header=hdr), fits.ImageHDU(pts, name="POINTS")]).writeto(args.out, overwrite=True)
+        print(f"wrote {args.out} (POINTS only)")
+        return
 
     # Pupil field: lattice -> inverse FFT, then fit the n = 0 term
     g = args.grid

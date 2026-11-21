@@ -50,12 +50,13 @@ def main():
                     help="e^{+i psi} speckle at c + side_sign*M@n; -1 was measured on try1/try2")
     ap.add_argument("--nmin", type=float, default=2.5, help="minimum |n|")
     ap.add_argument("--radius", type=float, default=4.0, help="window radius around +-2f [px]")
+    ap.add_argument("--fit-center", action="store_true", help="fit the optical axis (focal-plane mask in)")
     args = ap.parse_args()
 
     modes = xf.load_modes(args.modes)
     n, R, th, res, pairs = xf.mode_table(modes, args.grid)
     d = xf.load_set(args.data, modes, args.sci)
-    M, gres, ngood = xf.geometry(d, n)
+    M, gres, ngood = xf.geometry(d, n, fit_center=args.fit_center)
     resp, even, mref, amp, c, sig, yy, xx = (d[k] for k in ("resp", "even", "mref", "amp", "c", "sig", "yy", "xx"))
     nmax = (args.grid - 1) // 2
 

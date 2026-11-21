@@ -67,7 +67,12 @@ def poke_amplitudes(prefix, modes, sci="camsci1"):
 
 
 def load_set(prefix, modes, sci="camsci1"):
-    """Load resp, even, mean bias-subtracted ref, PSF center, amplitudes, and per-mode resp noise."""
+    """Load resp, even, mean bias-subtracted ref, PSF center, amplitudes, and per-mode resp noise.
+
+    The ref is dark-subtracted with `<prefix>_<sci>_dark.fits` when it exists, otherwise with the median
+    of the top and bottom 30 rows. The center is the centroid around the ref maximum; with a focal-plane
+    mask, refit it with geometry(..., fit_center=True).
+    """
     h = fits.getheader(f"{prefix}_{sci}_even.fits")
     if int(h["POKE0"]) != 0 or int(h["NAXIS3"]) != len(modes):
         raise ValueError("the data set must cover all modes of the mode cube, starting at 0")
@@ -76,7 +81,11 @@ def load_set(prefix, modes, sci="camsci1"):
     even = fits.getdata(f"{prefix}_{sci}_even.fits").astype(np.float32)
     ref = fits.getdata(f"{prefix}_{sci}_ref.fits")
     mref = ref.mean(0, dtype=np.float64)
-    mref -= np.median(np.concatenate([mref[:30].ravel(), mref[-30:].ravel()]))
+    darkf = f"{prefix}_{sci}_dark.fits"
+    if os.path.exists(darkf):
+        mref -= fits.getdata(darkf).astype(np.float64)
+    else:
+        mref -= np.median(np.concatenate([mref[:30].ravel(), mref[-30:].ravel()]))
 
     py, px = np.unravel_index(np.argmax(mref), mref.shape)
     win = np.clip(mref[py - 3:py + 4, px - 3:px + 4], 0, None)
@@ -87,18 +96,81 @@ def load_set(prefix, modes, sci="camsci1"):
     far = np.hypot(xx - c[0], yy - c[1]) > 0.42 * min(mref.shape)
     rf = resp[:, far]
     sig = 1.4826 * np.median(np.abs(rf - np.median(rf, 1)[:, None]), 1)
+    ef = even[:, far]
+    esig = 1.4826 * np.median(np.abs(ef - np.median(ef, 1)[:, None]), 1)
 
     return dict(resp=resp, even=even, mref=mref, c=c, amp=poke_amplitudes(prefix, modes, sci), sig=sig,
-                yy=yy, xx=xx, head=h)
+                esig=esig, yy=yy, xx=xx, head=h)
 
 
-def geometry(d, n):
-    """Fit the speckle geometry M (px per cycle) from the even cube, normalized to a positive trace."""
-    pk = sp.even_peaks(d["even"], d["c"][0], d["c"][1], core=8)
-    M, res, ngood = sp.fit_geometry(n, pk)
-    if np.trace(M) < 0:
-        M = -M
-    return M, res, ngood
+def geometry(d, n, nmin=4, nmax=20, search=4, clip=2.5, fit_center=False, M0=None):
+    """Fit the speckle geometry M (px per cycle) from the even cube, normalized to a positive trace.
+
+    A first fit uses each mode's brightest off-core pixel (sp.fit_geometry), with the SNR cut lowered
+    to the 70th percentile (at least 5) when fewer than 100 modes pass the default cut of 20. It is then
+    refined robustly: for both speckles of each mode with nmin < |n| < nmax, the peak of the 3x3-smoothed
+    even image within +-search px of the prediction, then least squares with points beyond clip px
+    rejected. Returns M, the rms residual of the kept points [px], and the number kept.
+
+    fit_center: also fit the optical-axis position and update d["c"] (needed with a focal-plane mask,
+    where the ref maximum is not the axis). Each mode then contributes only its brighter speckle, so
+    it also works when a knife edge blocks one of the pair. M0: the starting M, e.g. from a data set
+    without the mask; otherwise it comes from the brightest off-core pixels.
+    """
+    from scipy.ndimage import uniform_filter
+
+    even, c = d["even"], d["c"]
+    pk = sp.even_peaks(even, c[0], c[1], core=8)
+    snr = pk[:, 2] / pk[:, 3]
+    smin = 20 if (snr > 20).sum() >= 100 else max(5.0, np.percentile(snr, 70))
+    if M0 is None:
+        M, _, _ = sp.fit_geometry(n, pk, snr_min=smin)
+        if np.trace(M) < 0:
+            M = -M
+    else:
+        M = np.array(M0, float)
+
+    fr = np.hypot(*n.T)
+    ny, nx = even.shape[1:]
+    def collect(M, c):
+        X, Y = [], []
+        for k in np.where((fr > nmin) & (fr < nmax))[0]:
+            e = uniform_filter(np.asarray(even[k], dtype=np.float64), 3)
+            cand = []
+            for s in (1, -1):
+                q = c + s * (M @ n[k])
+                x0, y0 = int(round(q[0])), int(round(q[1]))
+                if not (search + 2 <= x0 < nx - search - 2 and search + 2 <= y0 < ny - search - 2):
+                    continue
+                sub = e[y0 - search:y0 + search + 1, x0 - search:x0 + search + 1]
+                dy, dx = np.unravel_index(np.argmax(sub), sub.shape)
+                cand.append((sub[dy, dx], s * n[k], [x0 - search + dx, y0 - search + dy]))
+            if fit_center and cand:
+                cand = [max(cand, key=lambda v: v[0])]
+            for _, xn, yp in cand:
+                X.append(xn)
+                Y.append(yp)
+        return np.array(X), np.array(Y, float)
+
+    def solve(X, Y, keep):
+        if fit_center:
+            A = np.c_[X, np.ones(len(X))]
+            sol = np.linalg.lstsq(A[keep], Y[keep], rcond=None)[0]
+            return sol[:2].T, sol[2]
+        return np.linalg.lstsq(X[keep], Y[keep] - c, rcond=None)[0].T, c
+
+    for _ in range(2 if fit_center else 1):
+        X, Y = collect(M, c)
+        keep = np.ones(len(X), bool)
+        for _ in range(4):
+            M, c = solve(X, Y, keep)
+            r = np.hypot(*(Y - c - X @ M.T).T)
+            keep = r < clip
+    M, c = solve(X, Y, keep)
+    r = np.hypot(*(Y - c - X @ M.T).T)
+    if fit_center:
+        d["c"] = np.asarray(c, float)
+    return M, float(np.sqrt(np.mean(r[keep] ** 2))), int(keep.sum())
 
 
 def solve_Z(o1, o2, th1, th2, s):

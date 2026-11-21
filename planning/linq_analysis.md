@@ -401,3 +401,41 @@ The DM → camsci1 map is the measured affine M: rotation −27.5°, 4% anamorph
 - **Large crosstalk:** a diagonal gain model explains only 71% (try1) and 49% (try2) of the response variance, while noise is 0.1–2%.
 
 **Decision (proposed): use the measured response, not the nominal basis.** Map $z \to c$ with a regularized inverse of the measured response matrix $\mathbf R_{mv}$ (1563 × 2400). For DM nonlinearity, use the per-sign states (mean ± resp, §9.12). CMmodesDM serves as the regularization prior and as a check. $\mathbf R_{mv}$ depends on amplitude (try1 vs try2), so measure it at science-like residual amplitudes, and correct for on-sky optical gain.
+
+### 9.14 try3–try5: Lyot stop, nSettle = 0, and the knife-edge coronagraph (2026-11-21)
+**Data sets.** All use `modFourier_48_shaped.fits` with `poke.amp=1`, `dm01disp02`, z-band, bump mask, camsci1 at 36 ms and ≈ 27 fps, EM gain 1, with INDI state and a dark recorded.
+
+| set | Lyot | FPM | ND | nSettle | nFrames | PSF peak [counts] |
+|---|---|---|---|---|---|---|
+| try3 | LyotLg1 | open | ND3 | 0 | 2 | 17.7k |
+| try4 | LyotLg1 | open | ND3 | 0 | 1 | 17.6k |
+| try5 | LyotLg1 | knifemask | open | 0 | 1 | 22k (core leak) |
+
+The try3 log holds three runs with the same prefix; the files are from the last one, which started at 07:04. This happened before the output prefix was timestamped. Its `fwlyot` record failed because of a typo in `indi.props`; the user confirmed the Lyot stop was in.
+
+**The Lyot stop.**
+- **Plate scale:** the speckle geometry is 1.95% smaller than in try2, with the same rotation (−27.94°). The user attributes the change to the Lyot stop.
+- **Pupil:** the reconstructed pupil is 42 actuators across with a 19–20-actuator obscuration, against 46 and 15 without the stop. So the reconstruction images the Lyot stop on the DM grid: center (24.9, 24.4–24.5) in both try3 and try4.
+- **Light:** PSF flux is 0.66 of try2's, and the peak 0.47.
+- **Tools:** at this SNR (median speckle SNR 9) the default geometry cut (SNR > 20) found no modes. `xlq_fourier.geometry` is now a robust two-step fit: a first fit with an adaptive SNR cut, then a local peak search with outlier rejection. The try2 results are unchanged by it (κ = 13.97 ± 3.15).
+
+**`nSettle=0` is clean.**
+- **Test:** if a fraction of an averaged frame still saw the previous DM state, the reference taken after the −a acquisition of mode k would contain mode k's odd pattern with coefficient −(leak)/2. Measured: try2 +0.003 ± 0.003, try3 +0.004 ± 0.004, try5 +0.000 ± 0.006. The leak is below about 1%.
+- **Timing:** the poke goes out just after a camsci1 post; the discarded frame arrives one period later (37.3 ms in try3), and the next exposure starts after the DM moved.
+- **Caveat:** this depends on camsci1's readout latency relative to the frame period. Recheck after changing the exposure time, ROI or readout mode.
+- **Consequence:** use `nSettle=0` with `nFrames=2` for the same time per poke as try2.
+
+**Stability over an hour (try3 vs try4).** The odd parts (∝ Re C*·S, so they depend on the quasi-static field) correlate, after correcting for noise, at 0.99 (|n| < 8), 0.975 (8–12), 0.94 (12–16) and 0.82–0.85 (|n| > 16, a noisy estimate). The observed decorrelation at high |n| is mostly noise. try4's noise is √2 times try3's, as expected for 1 vs 2 frames. Odd parts do not correlate between try2 and try3 beyond |n| ≈ 8, because the Lyot stop changes the field.
+
+**try5: knife-edge coronagraph.**
+- **Geometry:** only the lower half-plane (y ≲ 148) transmits, so each mode shows one speckle, and the transmitted core sits at the edge. The tools now take `--fit-center`, which fits the optical axis along with M from each mode's brighter speckle; it agrees with the PSF centroid to 0.1 px on try4. The try5 axis is at (148.3, 151.4), with the same M as try4. `load_set` subtracts the saved dark when present. `quadrature_field.py` drops speckles below `--min-snr` in the even part, and skips the pupil field when fewer than 90% of speckles have their twin visible (6% in try5).
+- **SNR:** the probe |Z| SNR is 20–170, 5–20× try3/4.
+- **Coherent fraction of the coronagraphic residual** (the part that interferes with the probes over the 10 min run):
+
+| radius [px] | 0–12 | 12–20 | 20–30 | 30–45 | 45–65 | 65–90 | 90–130 |
+|---|---|---|---|---|---|---|---|
+| R | 0.71 | 0.58 | 0.43 | 0.47 | 0.47 | 0.35 | 0.30 |
+
+  Unlike try2 (≈ 0.75, flat), R falls with radius. The causes are not separated yet: time variation within the run, bandwidth, and light from planes not conjugate to the DM.
+- **2f test:** both sides agree (16.9 ± 2.5 and 17.7 ± 3.8), which confirms the side sign with the coronagraph in. There is no DM 2f harmonic (|2f/fund| < 0.5% for |n| < 12). The fitted κ rises with |n|: 15.7 ± 1.2 (4–6), 18.3 ± 1.4 (6–8), 22.0 ± 1.0 (8–12), 26.6 ± 1.4 (12–18). See §9.15.
+- **Saturation:** one acquisition exceeded 37k (poke 16, + sign, 37,099).
