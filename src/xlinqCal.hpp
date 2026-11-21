@@ -176,7 +176,9 @@ class xlinqCal : public mx::app::application
 
     std::string m_outDir{ "." }; ///< Output directory, created if needed.
 
-    std::string m_outPrefix; ///< Output file prefix. Default is xlinqCal_<UTC timestamp>.
+    std::string m_outPrefix{ "xlinqCal" }; ///< Output file prefix, before the timestamp.
+
+    bool m_outTimestamp{ true }; ///< Append _<UTC timestamp> to the prefix.
 
     double m_checkpointMin{ 10 }; ///< Minutes between checkpoint writes of completed planes, 0 disables.
 
@@ -296,6 +298,9 @@ class xlinqCal : public mx::app::application
     /// Get the number of acquisitions with a camsci1 pixel above sci.linearMax.
     int nNonlin() const;
 
+    /// Get the output path prefix, `out.dir/<prefix>`, set when the run starts.
+    std::string outputPrefix() const;
+
     /// Get the timing table.
     const std::vector<timingRecord> &timing() const;
 
@@ -359,7 +364,17 @@ class xlinqCal : public mx::app::application
      */
     int preflight();
 
-    /// Create the output directory, set the prefix, and open the run log.
+    /// Append the timestamp to the prefix, and refuse a prefix that is already used in the output directory.
+    /** \returns 0 on success, -1 on error
+     */
+    int resolvePrefix();
+
+    /// Check whether any file in the output directory is named `<prefix>_*` or `<prefix>.*`.
+    /** \returns true if the prefix is in use, with one such file name in example
+     */
+    bool prefixInUse( std::string &example /**< [out] a file using the prefix */ ) const;
+
+    /// Create the output directory and open the run log.
     /** \returns 0 on success, -1 on error
      */
     int setupOutput();
@@ -601,6 +616,11 @@ inline int xlinqCal::nDone() const
 inline int xlinqCal::nNonlin() const
 {
     return m_nNonlin;
+}
+
+inline std::string xlinqCal::outputPrefix() const
+{
+    return outputPath( "" );
 }
 
 inline const std::vector<timingRecord> &xlinqCal::timing() const
@@ -936,7 +956,17 @@ inline void xlinqCal::setupConfig()
                 "prefix",
                 false,
                 "string",
-                "Output file prefix. Default xlinqCal_<UTC timestamp>." );
+                "Output file prefix, followed by _<UTC timestamp> unless out.timestamp=false. Default xlinqCal." );
+    config.add(
+        "out.timestamp",
+        "",
+        "out.timestamp",
+        argType::Required,
+        "out",
+        "timestamp",
+        false,
+        "bool",
+        "Append _<UTC timestamp> to the prefix. Default true. A prefix already used in out.dir is always refused." );
     config.add( "out.checkpointMin",
                 "",
                 "out.checkpointMin",
@@ -1000,6 +1030,7 @@ inline void xlinqCal::loadConfig()
 
     config( m_outDir, "out.dir" );
     config( m_outPrefix, "out.prefix" );
+    config( m_outTimestamp, "out.timestamp" );
     config( m_checkpointMin, "out.checkpointMin" );
 
     config( m_preflightTime, "preflight.time" );
@@ -1024,7 +1055,7 @@ inline int xlinqCal::execute()
         return -1;
     }
 
-    if( loadPokes() < 0 || openStreams() < 0 )
+    if( resolvePrefix() < 0 || loadPokes() < 0 || openStreams() < 0 )
     {
         return -1;
     }
@@ -1384,6 +1415,7 @@ inline int xlinqCal::preflight()
                             : std::string( "no dark" ) )
            << "\n";
     }
+    os << "  output:  " << outputPath( "_*" ) << "\n";
     os << "  estimate: " << hours << " h, " << gbytes << " GB output";
     log( os.str() );
 
@@ -1406,9 +1438,14 @@ inline int xlinqCal::preflight()
     return 0;
 }
 
-inline int xlinqCal::setupOutput()
+inline int xlinqCal::resolvePrefix()
 {
     if( m_outPrefix.empty() )
+    {
+        m_outPrefix = "xlinqCal";
+    }
+
+    if( m_outTimestamp )
     {
         timespec ts;
         clock_gettime( CLOCK_REALTIME, &ts );
@@ -1416,9 +1453,48 @@ inline int xlinqCal::setupOutput()
         tm uttime;
         gmtime_r( &ts.tv_sec, &uttime );
 
-        char buf[64];
-        strftime( buf, sizeof( buf ), "xlinqCal_%Y%m%dT%H%M%S", &uttime );
-        m_outPrefix = buf;
+        char buf[32];
+        strftime( buf, sizeof( buf ), "_%Y%m%dT%H%M%S", &uttime );
+        m_outPrefix += buf;
+    }
+
+    std::string example;
+    if( prefixInUse( example ) )
+    {
+        logError( "output prefix " + outputPath( "" ) + " is already used (" + example +
+                  "); choose another out.prefix so earlier results are not overwritten" );
+        return -1;
+    }
+
+    return 0;
+}
+
+inline bool xlinqCal::prefixInUse( std::string &example ) const
+{
+    std::error_code ec;
+
+    for( const auto &entry : std::filesystem::directory_iterator( m_outDir, ec ) )
+    {
+        std::string name = entry.path().filename().string();
+
+        if( name.size() > m_outPrefix.size() && name.compare( 0, m_outPrefix.size(), m_outPrefix ) == 0 &&
+            ( name[m_outPrefix.size()] == '_' || name[m_outPrefix.size()] == '.' ) )
+        {
+            example = name;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+inline int xlinqCal::setupOutput()
+{
+    std::string example;
+    if( prefixInUse( example ) )
+    {
+        logError( "output prefix " + outputPath( "" ) + " was used during the preflight (" + example + ")" );
+        return -1;
     }
 
     std::error_code ec;

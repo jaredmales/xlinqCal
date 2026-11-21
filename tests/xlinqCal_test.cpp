@@ -224,6 +224,7 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
                                       "--preflight.time=0.5",
                                       "--out.dir=" + dir.string(),
                                       "--out.prefix=test",
+                                      "--out.timestamp=false",
                                       "--snap.shmim=" + snapRef + "," + snapMask,
                                       "--yes" };
 
@@ -396,6 +397,17 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
                  .abs()
                  .maxCoeff() == 0 );
 
+    // A second run with the same prefix is refused before anything is written or poked
+    auto respTime = std::filesystem::last_write_time( dir / ( "test_" + cfg.sciName + "_resp.fits" ) );
+    auto logSize  = std::filesystem::file_size( dir / "test.log" );
+    {
+        xlinqCal::xlinqCal again;
+        REQUIRE( again.main( argv.size(), argv.data() ) == -1 );
+        REQUIRE( again.nDone() == 0 );
+    }
+    REQUIRE( std::filesystem::last_write_time( dir / ( "test_" + cfg.sciName + "_resp.fits" ) ) == respTime );
+    REQUIRE( std::filesystem::file_size( dir / "test.log" ) == logSize );
+
     sim.stop();
     std::filesystem::remove_all( dir );
 }
@@ -487,9 +499,16 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
 
     REQUIRE( ( dm() - initial ).abs().maxCoeff() == 0 );
 
+    // The default prefix is out.prefix_<UTC timestamp>
+    std::string pre = std::filesystem::path( app.outputPrefix() ).filename().string();
+    REQUIRE( pre.size() == std::string( "stop_YYYYMMDDTHHMMSS" ).size() );
+    REQUIRE( pre.compare( 0, 5, "stop_" ) == 0 );
+    REQUIRE( pre[13] == 'T' );
+    pre += "_";
+
     mx::improc::eigenCube<float> wfsFile;
     mx::fits::fitsHeader<>       head;
-    REQUIRE( ff.read( wfsFile, head, ( dir / ( "stop_" + cfg.wfsName + "_resp.fits" ) ).string() ) ==
+    REQUIRE( ff.read( wfsFile, head, ( dir / ( pre + cfg.wfsName + "_resp.fits" ) ).string() ) ==
              mx::error_t::noerror );
     REQUIRE( wfsFile.planes() == app.nDone() );
     REQUIRE( head["POKE0"].value<int>() == 5 );
@@ -497,15 +516,15 @@ TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xli
     REQUIRE( head["COMPLETE"].value<int>() == 0 );
 
     mx::improc::eigenCube<float> evenFile;
-    REQUIRE( ff.read( evenFile, ( dir / ( "stop_" + cfg.wfsName + "_even.fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( ff.read( evenFile, ( dir / ( pre + cfg.wfsName + "_even.fits" ) ).string() ) == mx::error_t::noerror );
     REQUIRE( evenFile.planes() == app.nDone() );
     REQUIRE( app.nRef() >= app.nDone() );
 
     // The changed snapshot stream is saved at the start (zeros) and at the end
     mx::improc::eigenImage<float> snapIm;
-    REQUIRE( ff.read( snapIm, ( dir / ( "stop_snap_" + snapRef + ".fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( ff.read( snapIm, ( dir / ( pre + "snap_" + snapRef + ".fits" ) ).string() ) == mx::error_t::noerror );
     REQUIRE( snapIm.abs().maxCoeff() == 0 );
-    REQUIRE( ff.read( snapIm, ( dir / ( "stop_snap_" + snapRef + "_end.fits" ) ).string() ) == mx::error_t::noerror );
+    REQUIRE( ff.read( snapIm, ( dir / ( pre + "snap_" + snapRef + "_end.fits" ) ).string() ) == mx::error_t::noerror );
     REQUIRE( snapIm( 3, 0 ) == 7 );
 
     dm.close();
@@ -689,6 +708,7 @@ TEST_CASE( "xlinqCal records INDI state and takes a dark", "[xlinqCal][integrati
                                           "--preflight.time=0.3",
                                           "--out.dir=" + dir.string(),
                                           "--out.prefix=" + prefix,
+                                          "--out.timestamp=false",
                                           "--indi.enable=true",
                                           "--indi.get=" + indi.getCmd,
                                           "--indi.set=" + indi.setCmd,

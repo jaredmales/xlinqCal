@@ -41,7 +41,7 @@ With the defaults, each poke takes 58 camsci1 frames, about 14.5 s at 4 Hz: 3 DM
 
 ## Outputs
 
-In `out.dir`, with prefix `out.prefix` (default `xlinqCal_<UTC>`):
+In `out.dir`, with prefix `<out.prefix>_<UTC timestamp>` (e.g. `xlinqCal_20261121T073542`; `out.prefix` defaults to `xlinqCal`). The timestamp is set at startup, so reusing `out.prefix` starts a new data set instead of overwriting. `out.timestamp=false` drops it. A prefix already used by any file in `out.dir` is refused before the preflight, with or without the timestamp. The preflight summary shows the output prefix.
 
 | file | content |
 |---|---|
