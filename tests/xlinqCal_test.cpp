@@ -813,8 +813,10 @@ TEST_CASE( "xlinqCal records INDI state and takes a dark", "[xlinqCal][integrati
     std::filesystem::remove_all( dir );
 }
 
-/// With a saturated core, xlinqCal takes unsaturated PSFs with the ND wheel at the start and end, puts the wheel
-/// back each time, and excludes the core from the linearity check. It refuses to saturate with EM gain > 1.
+/// With a saturated core, xlinqCal takes unsaturated PSFs with the ND wheel at the start and end, with +/- calibration
+/// speckles at both filters whose ratio is the transmission, puts the wheel back each time, and excludes the core
+/// from the linearity check. Already at the PSF filter, it takes the block in place. It refuses to saturate with
+/// EM gain > 1.
 TEST_CASE( "xlinqCal takes unsaturated PSFs with the ND wheel", "[xlinqCal][integration][indi]" )
 {
     using namespace xlinqCal;
@@ -850,6 +852,7 @@ TEST_CASE( "xlinqCal takes unsaturated PSFs with the ND wheel", "[xlinqCal][inte
     cfg.sciSat       = 50000;
     cfg.attenFile    = ( indi.state / ( wheel + ".filterName.ND3_0" ) ).string();
     cfg.attenFactor  = 0.01;
+    cfg.sciQuadGain  = 200; // the calibration speckle intensity
 
     mx::improc::eigenCube<float> pokes    = xlinqSim::randomPokes( cfg.dmRows, cfg.dmCols, 2, 3 );
     std::string                  pokeFile = ( dir / "pokes.fits" ).string();
@@ -903,26 +906,63 @@ TEST_CASE( "xlinqCal takes unsaturated PSFs with the ND wheel", "[xlinqCal][inte
     const std::vector<std::string> psfArgs = {
         "--psf.n=3", "--psf.wheel=" + wheel, "--psf.filter=ND3_0", "--psf.discard=1", "--sci.satRadius=4" };
 
-    SECTION( "saturated run with PSFs at the start and end" )
+    // Pixels outside the core mask, unsaturated in every plane: (+ + -)/2 - reference summed over them
+    auto speckleSum = [&]( const mx::improc::eigenCube<float> &c, int p0, const mx::improc::eigenCube<float> &all )
     {
-        result r = runApp( "psf", psfArgs );
+        double sum = 0;
+        int    n   = 0;
+        for( int cc = 0; cc < c.cols(); ++cc )
+        {
+            for( int rr = 0; rr < c.rows(); ++rr )
+            {
+                bool ok = std::hypot( rr - 5.5, cc - 5.5 ) > 4.5;
+                for( int p = 0; p < all.planes(); ++p )
+                {
+                    ok = ok && all.image( p )( rr, cc ) < 37000;
+                }
+                if( ok )
+                {
+                    sum +=
+                        0.5 * ( c.image( p0 + 1 )( rr, cc ) + c.image( p0 + 2 )( rr, cc ) ) - c.image( p0 )( rr, cc );
+                    ++n;
+                }
+            }
+        }
+        REQUIRE( n > 50 );
+        return sum;
+    };
+
+    SECTION( "saturated run with PSFs and calibration speckles at the start and end" )
+    {
+        std::vector<std::string> a = psfArgs;
+        a.push_back( "--psf.speckAmp=0.5" );
+        a.push_back( "--psf.speckSep=10" );
+        result r = runApp( "psf", a );
         REQUIRE( r.rv == 0 );
         REQUIRE( r.nDone == 2 );
         REQUIRE( r.nNonlin == 0 ); // the saturated core is masked
 
-        // Both PSFs are unsaturated, attenuated copies of the core
+        // Both PSFs are unsaturated, attenuated copies of the core, and the speckle ratio is the transmission
         double expectPeak =
             cfg.sciDark + cfg.attenFactor * ( cfg.sciLevel - cfg.sciDark + cfg.sciCoreAmp * exp( -0.25 / 2.25 ) );
         for( const std::string suf : { "_psf.fits", "_psf_end.fits" } )
         {
-            mx::improc::eigenImage<float> psf;
-            mx::fits::fitsHeader<>        head;
+            mx::improc::eigenCube<float> psf;
+            mx::fits::fitsHeader<>       head;
             INFO( suf );
             REQUIRE( ff.read( psf, head, ( dir / ( "psf_" + cfg.sciName + suf ) ).string() ) == mx::error_t::noerror );
-            REQUIRE( psf.maxCoeff() == Approx( expectPeak ).epsilon( 0.05 ) );
+            REQUIRE( psf.planes() == 6 );
+            REQUIRE( psf.image( 0 ).maxCoeff() == Approx( expectPeak ).epsilon( 0.05 ) );
+            REQUIRE( psf.image( 3 ).maxCoeff() == Approx( cfg.sciSat ).epsilon( 0.01 ) );
             REQUIRE( head["PSFFILT"].value<std::string>().substr( 0, 5 ) == "ND3_0" );
             REQUIRE( head["ORIGFILT"].value<std::string>().substr( 0, 5 ) == "ND1_0" );
+            REQUIRE( head["PLANE4"].value<std::string>() == "ND1_0, DM reference + speckles" );
             REQUIRE( head["PSFMAX"].value<double>() < 37000 );
+            REQUIRE( head["SPKAMP"].value<double>() == Approx( 0.5 ) );
+
+            double sPsf = speckleSum( psf, 0, psf ), sCal = speckleSum( psf, 3, psf );
+            REQUIRE( sCal > 0 );
+            REQUIRE( sPsf / sCal == Approx( cfg.attenFactor ).epsilon( 0.03 ) );
         }
 
         // The calibration frames are saturated, and the header records the mask and the PSFs
@@ -966,14 +1006,135 @@ TEST_CASE( "xlinqCal takes unsaturated PSFs with the ND wheel", "[xlinqCal][inte
         REQUIRE( indi.lines( "setlog" ).empty() );
     }
 
-    SECTION( "refuses when the wheel is already at the PSF filter" )
+    SECTION( "takes the PSF block in place when the wheel is already at the PSF filter" )
     {
         indi.set( wheel + ".filterName.ND1_0", "Off" );
         indi.set( wheel + ".filterName.ND3_0", "On" );
-        result r = runApp( "atpsf", psfArgs );
+        std::vector<std::string> a = psfArgs;
+        a.push_back( "--psf.speckAmp=0.5" );
+        result r = runApp( "atpsf", a );
+        REQUIRE( r.rv == 0 );
+        REQUIRE( r.nDone == 2 );
+        REQUIRE( indi.lines( "setlog" ).empty() );
+
+        mx::improc::eigenCube<float> psf;
+        mx::fits::fitsHeader<>       head;
+        REQUIRE( ff.read( psf, head, ( dir / ( "atpsf_" + cfg.sciName + "_psf_end.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        REQUIRE( psf.planes() == 3 );
+        REQUIRE( head["PSFMOVE"].value<int>() == 0 );
+        REQUIRE( speckleSum( psf, 0, psf ) > 0 );
+    }
+
+    SECTION( "a PSF block without speckles is one plane" )
+    {
+        result r = runApp( "plain", psfArgs );
+        REQUIRE( r.rv == 0 );
+        mx::improc::eigenCube<float> psf;
+        mx::fits::fitsHeader<>       head;
+        REQUIRE( ff.read( psf, head, ( dir / ( "plain_" + cfg.sciName + "_psf.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        REQUIRE( psf.planes() == 1 );
+        REQUIRE( indi.lines( "setlog" ).size() == 4 );
+    }
+
+    SECTION( "low orders unsaturated at the PSF filter, the rest saturated" )
+    {
+        std::vector<std::string> a = psfArgs;
+        a.push_back( "--psf.speckAmp=0.5" );
+        a.push_back( "--psf.unsatLast=0" );
+        result r = runApp( "split", a );
+        REQUIRE( r.rv == 0 );
+        REQUIRE( r.nDone == 2 );
+        REQUIRE( r.nNonlin == 0 );
+
+        // References: start and after poke 0 at ND3_0, then after the switch and after poke 1 at ND1_0
+        mx::improc::eigenCube<float> ref, even;
+        mx::fits::fitsHeader<>       head, ehead;
+        REQUIRE( ff.read( ref, head, ( dir / ( "split_" + cfg.sciName + "_ref.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        REQUIRE( ref.planes() == 4 );
+        REQUIRE( head["UNSATLST"].value<int>() == 0 );
+        REQUIRE( head["NREFUNS"].value<int>() == 2 );
+        for( int p = 0; p < 4; ++p )
+        {
+            INFO( p );
+            REQUIRE( ( ref.image( p ).maxCoeff() < 37000 ) == ( p < 2 ) );
+        }
+
+        // Each poke's even part uses references at its own filter: no saturated-minus-unsaturated core
+        REQUIRE( ff.read( even, ehead, ( dir / ( "split_" + cfg.sciName + "_even.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        for( int p = 0; p < 2; ++p )
+        {
+            INFO( p );
+            REQUIRE( std::fabs( even.image( p )( 5, 5 ) ) < 200 );
+            REQUIRE( std::fabs( even.image( p )( 6, 6 ) ) < 200 );
+        }
+
+        // The timing table flags the unsaturated acquisitions
+        mx::improc::eigenImage<double> tab;
+        mx::fits::fitsHeader<>         thead;
+        mx::fits::fitsFile<double>     fd;
+        REQUIRE( fd.read( tab, thead, ( dir / "split_timing.fits" ).string() ) == mx::error_t::noerror );
+        REQUIRE( thead["TCOL" + std::to_string( timingCol::unsat )].value<std::string>().substr( 0, 5 ) == "UNSAT" );
+        int nU = 0, nS = 0;
+        for( int rr = 0; rr < tab.cols(); ++rr )
+        {
+            double pk = tab( timingCol::poke, rr );
+            if( pk == pk ) // a poke, not a reference
+            {
+                REQUIRE( tab( timingCol::unsat, rr ) == ( pk == 0 ? 1 : 0 ) );
+                ( pk == 0 ? nU : nS )++;
+            }
+        }
+        REQUIRE( nU == 4 );
+        REQUIRE( nS == 4 );
+
+        // Wheel: start block, the segment, end block; back at ND1_0
+        std::vector<std::string> sets = indi.lines( "setlog" );
+        REQUIRE( sets.size() == 6 );
+        for( size_t i = 0; i < sets.size(); ++i )
+        {
+            REQUIRE( sets[i] == "-s " + wheel + ".filterName." + ( i % 2 == 0 ? "ND3_0" : "ND1_0" ) + "=On" );
+        }
+        REQUIRE( indi.get( wheel + ".filterName.ND1_0" ) == "On" );
+    }
+
+    SECTION( "a run ending in the unsaturated segment puts the wheel back" )
+    {
+        std::vector<std::string> a = { "--psf.wheel=" + wheel, "--psf.filter=ND3_0", "--psf.unsatLast=5" };
+        result                   r = runApp( "allunsat", a );
+        REQUIRE( r.rv == 0 );
+        REQUIRE( r.nDone == 2 );
+        mx::improc::eigenCube<float> ref;
+        mx::fits::fitsHeader<>       head;
+        REQUIRE( ff.read( ref, head, ( dir / ( "allunsat_" + cfg.sciName + "_ref.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        REQUIRE( head["NREFUNS"].value<int>() == head["NREF"].value<int>() );
+        for( int p = 0; p < ref.planes(); ++p )
+        {
+            REQUIRE( ref.image( p ).maxCoeff() < 37000 );
+        }
+        REQUIRE( indi.lines( "setlog" ).size() == 2 );
+        REQUIRE( indi.get( wheel + ".filterName.ND1_0" ) == "On" );
+    }
+
+    SECTION( "an unsaturated segment needs the wheel away from the PSF filter" )
+    {
+        indi.set( wheel + ".filterName.ND1_0", "Off" );
+        indi.set( wheel + ".filterName.ND3_0", "On" );
+        result r = runApp( "splitat", { "--psf.wheel=" + wheel, "--psf.filter=ND3_0", "--psf.unsatLast=0" } );
         REQUIRE( r.rv == -1 );
         REQUIRE( r.nDone == 0 );
         REQUIRE( indi.lines( "setlog" ).empty() );
+    }
+
+    SECTION( "calibration speckles need a PSF block" )
+    {
+        result r = runApp( "nopsf", { "--psf.speckAmp=0.5" } );
+        REQUIRE( r.rv == -1 );
+        REQUIRE( r.nDone == 0 );
     }
 
     SECTION( "refuses to saturate with EM gain above 1" )

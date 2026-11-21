@@ -66,12 +66,18 @@ def poke_amplitudes(prefix, modes, sci="camsci1"):
     return np.full(len(modes), float(h["POKEAMP"]))
 
 
-def load_set(prefix, modes, sci="camsci1"):
+def load_set(prefix, modes, sci="camsci1", trans=None):
     """Load resp, even, mean bias-subtracted ref, PSF center, amplitudes, and per-mode resp noise.
 
     The ref is dark-subtracted with `<prefix>_<sci>_dark.fits` when it exists, otherwise with the median
     of the top and bottom 30 rows. The center is the centroid around the ref maximum; with a focal-plane
     mask, refit it with geometry(..., fit_center=True).
+
+    A run with an unsaturated segment (header UNSATLST >= 0: pokes <= UNSATLST and the first NREFUNS refs
+    taken at PSFFILT) is put on the calibration-filter scale: those resp and even planes are divided by the
+    transmission T (trans, else psf_flux.run_transmission from the PSF blocks' calibration speckles), and
+    the mean ref uses the calibration-filter refs only (or all refs / T if there are none). d["trans"] is T,
+    or 1 without a segment.
     """
     h = fits.getheader(f"{prefix}_{sci}_even.fits")
     if int(h["POKE0"]) != 0 or int(h["NAXIS3"]) != len(modes):
@@ -80,12 +86,26 @@ def load_set(prefix, modes, sci="camsci1"):
     resp = fits.getdata(f"{prefix}_{sci}_resp.fits").astype(np.float32)
     even = fits.getdata(f"{prefix}_{sci}_even.fits").astype(np.float32)
     ref = fits.getdata(f"{prefix}_{sci}_ref.fits")
-    mref = ref.mean(0, dtype=np.float64)
+
+    nu = int(h.get("UNSATLST", -1)) + 1  # unsaturated pokes (POKE0 is 0)
+    nru = int(h.get("NREFUNS", 0))
+    T = 1.0
+    if nu > 0:
+        if trans is None:
+            import psf_flux
+            trans, _ = psf_flux.run_transmission(prefix, sci)
+        T = float(trans)
+        resp[:nu] /= T
+        even[:nu] /= T
+    refs, rscale = (ref[nru:], 1.0) if nru < len(ref) else (ref, T)
+
+    mref = refs.mean(0, dtype=np.float64)
     darkf = f"{prefix}_{sci}_dark.fits"
     if os.path.exists(darkf):
         mref -= fits.getdata(darkf).astype(np.float64)
     else:
         mref -= np.median(np.concatenate([mref[:30].ravel(), mref[-30:].ravel()]))
+    mref /= rscale
 
     py, px = np.unravel_index(np.argmax(mref), mref.shape)
     win = np.clip(mref[py - 3:py + 4, px - 3:px + 4], 0, None)
@@ -100,7 +120,7 @@ def load_set(prefix, modes, sci="camsci1"):
     esig = 1.4826 * np.median(np.abs(ef - np.median(ef, 1)[:, None]), 1)
 
     return dict(resp=resp, even=even, mref=mref, c=c, amp=poke_amplitudes(prefix, modes, sci), sig=sig,
-                esig=esig, yy=yy, xx=xx, head=h)
+                esig=esig, yy=yy, xx=xx, head=h, trans=T)
 
 
 def geometry(d, n, nmin=4, nmax=20, search=4, clip=2.5, fit_center=False, M0=None):

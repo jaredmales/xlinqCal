@@ -79,6 +79,7 @@ enum : int
     sciAtimeFirst, ///< Acquisition time (stream atime) of the first averaged camsci1 frame, Unix seconds.
     sciAtimeLast,  ///< Acquisition time (stream atime) of the last averaged camsci1 frame, Unix seconds.
     sciMax,        ///< Maximum pixel value over the averaged camsci1 frames.
+    unsat,         ///< 1 if taken with the wheel at psf.filter (the unsaturated segment, psf.unsatLast), else 0.
     nCommon        ///< The number of common columns; per-WFS-stream columns follow.
 };
 } // namespace timingCol
@@ -176,9 +177,20 @@ class xlinqCal : public mx::app::application
 
     std::string m_psfFilter{ "ND3_0" }; ///< The wheel's filterName element used for the PSF.
 
-    unsigned m_psfDiscard{ 2 }; ///< camsci1 frames discarded after the wheel arrives.
+    unsigned m_psfDiscard{ 2 }; ///< camsci1 frames discarded after each wheel move or DM change in a PSF block,
+                                ///< beyond the one in progress.
 
-    double m_psfWait{ 30 }; ///< Timeout [s] for the wheel to reach the requested filter.
+    double m_psfWait{ 10 }; ///< Timeout [s] for the wheel to reach the requested filter.
+
+    float m_psfSpeckAmp{ 0 }; ///< Amplitude [um] of each calibration speckle sinusoid in a PSF block, 0 for none.
+
+    double m_psfSpeckSep{ 15 }; ///< Calibration speckle spatial frequency [cycles across the DM].
+
+    double m_psfSpeckAngle{ 0 }; ///< Calibration speckle angle [deg] from the DM first axis toward the second.
+
+    bool m_psfSpeckCross{ true }; ///< If true, add the calibration sinusoid rotated by 90 degrees (4 speckles).
+
+    int m_psfUnsatLast{ -1 }; ///< Pokes up to this index are measured with the wheel at psf.filter, -1 for none.
 
     double m_sciSatRadius{ 0 }; ///< Radius [px] of the core mask excluded from the linearity check, 0 for none.
 
@@ -223,6 +235,12 @@ class xlinqCal : public mx::app::application
     unsigned m_darkTaken{ 0 }; ///< Frames in the saved dark, 0 if none.
 
     std::string m_psfOrig; ///< The wheel's filter at the start, restored after each PSF block.
+
+    bool m_psfMove{ false }; ///< True if the PSF blocks move the wheel (it starts away from psf.filter).
+
+    bool m_atUnsat{ false }; ///< True while the run is in its unsaturated segment, with the wheel at psf.filter.
+
+    int m_nRefUnsat{ 0 }; ///< Number of references taken in the unsaturated segment (the first ones).
 
     bool m_wheelMoved{ false }; ///< True if xlinqCal moved the wheel and has not confirmed it back at m_psfOrig.
 
@@ -542,11 +560,38 @@ class xlinqCal : public mx::app::application
      */
     int moveWheel( const std::string &filter /**< [in] the filterName element */ );
 
-    /// Take an unsaturated PSF: wheel to psf.filter, discard, average psf.n frames, wheel back, save.
-    /** The wheel is always commanded back to its original filter once moved, even on error or stop.
+    /// Take a PSF block and save it as a cube of psf.n-frame means.
+    /** Plane 0 is at psf.filter with the DM at its reference. With calibration speckles (psf.speckAmp > 0),
+     * planes 1 and 2 add +speckles and -speckles there, and if the wheel moves, planes 3-5 repeat
+     * reference, +, - at the calibration filter first. (+ + -)/2 - reference is the speckle intensity free
+     * of interference with the static field, so its ratio between the filters is their transmission
+     * ratio. The wheel moves only if it starts away from psf.filter; a coronagraphic run at psf.filter
+     * takes the block in place. The DM is restored, and the wheel commanded back once moved, even on
+     * error or stop.
      * \returns 0 on success, 1 if stopped, -1 on error
      */
     int takePsf( const std::string &suffix /**< [in] appended to the output prefix, e.g. _psf.fits */ );
+
+    /// Set the DM, discard the frame in progress and psf.discard more, and average psf.n camsci1 frames.
+    /** \returns 0 on success, 1 if stopped, -1 on error */
+    int psfAverage( const mx::improc::eigenImage<float> &cmd, /**< [in] the DM channel command */
+                    bool                            full, /**< [in] max over the full frame, else outside the core */
+                    mx::improc::eigenImage<double> &mean, /**< [out] the mean frame */
+                    double                         &maxv  /**< [in,out] running maximum pixel value */
+    );
+
+    /// The calibration speckle DM shape: psf.speckAmp cos(2 pi n.x), plus the 90-degree rotation if crossed.
+    mx::improc::eigenImage<float> speckleShape() const;
+
+    /// True if the filter wheel is used: PSF blocks or an unsaturated segment.
+    bool wheelNeeded() const;
+
+    /// The number of references planned for nPoke pokes, including the two at a segment switch.
+    int plannedRefs( int nPoke /**< [in] pokes in the run */ ) const;
+
+    /// Move the wheel to psf.filter (unsat) or back to the calibration filter, and force the next acquisition to
+    /// settle. \returns 0 on success, -1 on error
+    int switchSegment( bool unsat /**< [in] true for psf.filter */ );
 
     /// Set the core mask from a frame: centered on the saturated pixels (or the maximum), radius sci.satRadius.
     void setCoreMask( const mx::improc::eigenImage<double> &frame /**< [in] a camsci1 frame */ );
@@ -1001,7 +1046,8 @@ inline void xlinqCal::setupConfig()
                 "discard",
                 false,
                 "int",
-                "Frames discarded after the wheel arrives. Default 2." );
+                "Frames discarded after each wheel move or DM change in a PSF block, beyond the one in progress. "
+                "Default 2." );
     config.add( "psf.wait",
                 "",
                 "psf.wait",
@@ -1010,7 +1056,55 @@ inline void xlinqCal::setupConfig()
                 "wait",
                 false,
                 "float",
-                "Timeout for the wheel to reach the requested filter [s]. Default 30." );
+                "Timeout for the wheel to reach the requested filter [s]. Default 10." );
+    config.add( "psf.unsatLast",
+                "",
+                "psf.unsatLast",
+                argType::Required,
+                "psf",
+                "unsatLast",
+                false,
+                "int",
+                "Pokes up to this index are measured with psf.wheel at psf.filter (unsaturated, e.g. the low orders "
+                "near a bleeding core), the rest at the calibration filter. A reference is taken on each side of the "
+                "switch. Needs indi.enable. -1 for none. Default -1." );
+    config.add( "psf.speckAmp",
+                "",
+                "psf.speckAmp",
+                argType::Required,
+                "psf",
+                "speckAmp",
+                false,
+                "float",
+                "Amplitude [um] of each calibration speckle sinusoid, applied as + and - in each PSF block at both "
+                "filters for the flux ratio. 0 for none. Default 0." );
+    config.add( "psf.speckSep",
+                "",
+                "psf.speckSep",
+                argType::Required,
+                "psf",
+                "speckSep",
+                false,
+                "float",
+                "Calibration speckle spatial frequency [cycles across the DM]. Default 15." );
+    config.add( "psf.speckAngle",
+                "",
+                "psf.speckAngle",
+                argType::Required,
+                "psf",
+                "speckAngle",
+                false,
+                "float",
+                "Calibration speckle angle [deg] from the DM first axis toward the second. Default 0." );
+    config.add( "psf.speckCross",
+                "",
+                "psf.speckCross",
+                argType::Required,
+                "psf",
+                "speckCross",
+                false,
+                "bool",
+                "Also apply the calibration sinusoid rotated by 90 degrees, for 4 speckles. Default true." );
     config.add( "sci.satRadius",
                 "",
                 "sci.satRadius",
@@ -1129,6 +1223,11 @@ inline void xlinqCal::loadConfig()
     config( m_psfFilter, "psf.filter" );
     config( m_psfDiscard, "psf.discard" );
     config( m_psfWait, "psf.wait" );
+    config( m_psfSpeckAmp, "psf.speckAmp" );
+    config( m_psfSpeckSep, "psf.speckSep" );
+    config( m_psfSpeckAngle, "psf.speckAngle" );
+    config( m_psfSpeckCross, "psf.speckCross" );
+    config( m_psfUnsatLast, "psf.unsatLast" );
     config( m_sciSatRadius, "sci.satRadius" );
 
     m_indi.commands( m_indiGet, m_indiSet );
@@ -1182,6 +1281,30 @@ inline int xlinqCal::execute()
         return -1;
     }
 
+    if( m_psfUnsatLast >= 0 && !m_indiEnable )
+    {
+        logError( "psf.unsatLast >= 0 needs indi.enable=true" );
+        return -1;
+    }
+
+    if( m_psfUnsatLast >= m_pokeFirst && ( m_psfN == 0 || m_psfSpeckAmp <= 0 ) )
+    {
+        log( "warning: psf.unsatLast without PSF blocks with calibration speckles (psf.n, psf.speckAmp): the flux "
+             "ratio between the segments will not be measured" );
+    }
+
+    if( m_psfSpeckAmp < 0 || ( m_psfSpeckAmp > 0 && m_psfN == 0 ) )
+    {
+        logError( "psf.speckAmp must be >= 0, and needs psf.n > 0" );
+        return -1;
+    }
+
+    if( m_psfSpeckAmp > 0 && !( m_psfSpeckSep > 0 && m_psfSpeckSep < 0.5 * std::min( m_dm.rows(), m_dm.cols() ) ) )
+    {
+        logError( "psf.speckSep must be above 0 and below the DM Nyquist frequency" );
+        return -1;
+    }
+
     if( indiPreflight() < 0 )
     {
         return -1;
@@ -1226,6 +1349,16 @@ inline int xlinqCal::execute()
 
     restoreDm();
     stopWfsThread();
+
+    // Back from the unsaturated segment, if the run ended in it (complete, stopped, or on error)
+    if( m_wheelMoved )
+    {
+        if( switchSegment( false ) != 0 )
+        {
+            logError( "THE " + m_psfWheel + " FILTER WHEEL MAY NOT BE AT " + m_psfOrig + ": check it" );
+            rv = -1;
+        }
+    }
 
     if( checkEndSnapshots() < 0 )
     {
@@ -1450,7 +1583,7 @@ inline int xlinqCal::openStreams()
     }
 
     int nPoke = m_pokeLast - m_pokeFirst + 1;
-    int nRef  = ( m_refEvery > 0 ) ? ( nPoke + m_refEvery - 1 ) / m_refEvery + 1 : 0;
+    int nRef  = plannedRefs( nPoke );
 
     m_sciProd.allocate( m_sci.rows(), m_sci.cols(), nPoke, nRef );
 
@@ -1519,7 +1652,7 @@ inline int xlinqCal::preflight()
     std::vector<int> signs         = signSequence( m_nRepeat );
     int              nPoke         = m_pokeLast - m_pokeFirst + 1;
     double           framesPerPoke = settleCount( signs ) * ( 1.0 + m_sciSettle ) + signs.size() * m_sciFrames;
-    int              nRef          = ( m_refEvery > 0 ) ? ( nPoke + m_refEvery - 1 ) / m_refEvery + 1 : 0;
+    int              nRef          = plannedRefs( nPoke );
     double           frames        = nPoke * framesPerPoke + nRef * ( 1.0 + m_sciSettle + m_sciFrames );
     double           hours         = frames / m_sciFps / 3600.;
     double           planes        = ( m_refEvery > 0 ) ? 3.0 * nPoke + nRef : 2.0 * nPoke; // resp, mean, [even, ref]
@@ -1568,8 +1701,32 @@ inline int xlinqCal::preflight()
     }
     if( m_psfN > 0 )
     {
-        os << "  psf:     " << m_psfN << " frames with " << m_psfWheel << " at " << m_psfFilter
-           << " before the first poke and after the run, then back to " << m_psfOrig << "\n";
+        os << "  psf:     " << m_psfN << " frames per plane before the first poke and after the run, ";
+        if( m_psfMove )
+        {
+            os << "with " << m_psfWheel << " at " << m_psfFilter << ", then back to " << m_psfOrig;
+        }
+        else
+        {
+            os << "in place (" << m_psfWheel << " already at " << m_psfFilter << ")";
+        }
+        if( m_psfSpeckAmp > 0 )
+        {
+            os << "; +/- calibration speckles " << m_psfSpeckAmp << " um at " << m_psfSpeckSep << " cycles, "
+               << m_psfSpeckAngle << " deg" << ( m_psfSpeckCross ? ", crossed" : "" )
+               << ( m_psfMove ? ", at both filters" : "" );
+        }
+        os << "\n";
+    }
+    if( m_psfUnsatLast >= m_pokeFirst )
+    {
+        os << "  split:   pokes " << m_pokeFirst << "-" << std::min( m_psfUnsatLast, m_pokeLast )
+           << " unsaturated with " << m_psfWheel << " at " << m_psfFilter;
+        if( m_psfUnsatLast < m_pokeLast )
+        {
+            os << ", then " << m_psfUnsatLast + 1 << "-" << m_pokeLast << " at " << m_psfOrig;
+        }
+        os << "\n";
     }
     os << "  output:  " << outputPath( "_*" ) << "\n";
     os << "  estimate: " << hours << " h, " << gbytes << " GB output";
@@ -1693,7 +1850,9 @@ inline void xlinqCal::stopWfsThread()
 
 inline timingRecord xlinqCal::newRecord() const
 {
-    return timingRecord( timingCol::nCommon + m_wfs.size() * wfsCol::nCols, std::numeric_limits<double>::quiet_NaN() );
+    timingRecord rec( timingCol::nCommon + m_wfs.size() * wfsCol::nCols, std::numeric_limits<double>::quiet_NaN() );
+    rec[timingCol::unsat] = m_atUnsat ? 1 : 0;
+    return rec;
 }
 
 inline int xlinqCal::run()
@@ -1702,6 +1861,11 @@ inline int xlinqCal::run()
     double tStart   = nowSec();
     double tLastChk = tStart;
     int    rv;
+
+    if( m_psfUnsatLast >= m_pokeFirst && ( rv = switchSegment( true ) ) != 0 )
+    {
+        return rv;
+    }
 
     m_sciLastCnt0 = m_sci.cnt0();
 
@@ -1724,9 +1888,27 @@ inline int xlinqCal::run()
 
         ++m_nDone;
 
-        if( m_refEvery > 0 && ( m_nDone % m_refEvery == 0 || k == m_pokeLast ) && ( rv = measureRef() ) != 0 )
+        // At the end of the unsaturated segment: a reference on each side of the wheel move, so the even part of
+        // every poke is interpolated between references at its own filter
+        bool switchNow = m_atUnsat && k == m_psfUnsatLast && k < m_pokeLast;
+
+        if( m_refEvery > 0 && ( m_nDone % m_refEvery == 0 || k == m_pokeLast || switchNow ) &&
+            ( rv = measureRef() ) != 0 )
         {
             return rv;
+        }
+
+        if( switchNow )
+        {
+            if( ( rv = switchSegment( false ) ) != 0 )
+            {
+                return rv;
+            }
+
+            if( m_refEvery > 0 && ( rv = measureRef() ) != 0 )
+            {
+                return rv;
+            }
         }
 
         const timingRecord &last    = m_timing.back();
@@ -1835,6 +2017,11 @@ inline int xlinqCal::measureRef()
 
     m_refTime.push_back( 0.5 * ( rec[timingCol::tStart] + rec[timingCol::tEnd] ) );
     ++m_nRef;
+
+    if( m_atUnsat )
+    {
+        ++m_nRefUnsat;
+    }
 
     m_timing.push_back( rec );
 
@@ -2248,7 +2435,7 @@ inline std::vector<std::string> xlinqCal::indiPropList() const
         props.push_back( m_sciDevice + p );
     }
 
-    if( m_psfN > 0 )
+    if( wheelNeeded() )
     {
         props.push_back( m_psfWheel + ".fsm" );
         props.push_back( m_psfWheel + ".filterName" );
@@ -2306,7 +2493,7 @@ inline int xlinqCal::indiPreflight()
         log( "warning: INDI " + err );
     }
 
-    if( m_psfN > 0 )
+    if( wheelNeeded() )
     {
         if( !indiClient::validName( m_psfWheel + ".filterName." + m_psfFilter, 2 ) )
         {
@@ -2346,10 +2533,12 @@ inline int xlinqCal::indiPreflight()
             return -1;
         }
 
-        if( m_psfOrig == m_psfFilter )
+        m_psfMove = ( m_psfOrig != m_psfFilter );
+
+        if( m_psfUnsatLast >= 0 && !m_psfMove )
         {
             logError( m_psfWheel + " is already at psf.filter=" + m_psfFilter +
-                      ": set the wheel for the (saturated) calibration first" );
+                      ": psf.unsatLast needs the run to start at the (saturated) calibration filter" );
             return -1;
         }
 
@@ -2359,7 +2548,8 @@ inline int xlinqCal::indiPreflight()
             return -1;
         }
 
-        log( "INDI: " + m_psfWheel + " at " + m_psfOrig + ", PSF with " + m_psfFilter );
+        log( "INDI: " + m_psfWheel + " at " + m_psfOrig +
+             ( m_psfMove ? ", PSF with " + m_psfFilter : ", already at psf.filter: PSF blocks without moving it" ) );
     }
 
     if( m_darkN == 0 )
@@ -2619,56 +2809,219 @@ inline int xlinqCal::moveWheel( const std::string &filter )
     }
 }
 
-inline int xlinqCal::takePsf( const std::string &suffix )
+inline bool xlinqCal::wheelNeeded() const
 {
-    log( "taking PSF: " + std::to_string( m_psfN ) + " frames with " + m_psfWheel + " at " + m_psfFilter );
+    return m_psfN > 0 || m_psfUnsatLast >= 0;
+}
 
-    m_wheelMoved = true; // from the command on, the wheel may have moved
-
-    int rv = moveWheel( m_psfFilter );
-
-    timespec ts;
-    clock_gettime( CLOCK_REALTIME, &ts );
-    std::string psfBeg = isoTime( ts );
-
-    uint64_t                       cnt0;
-    mx::improc::eigenImage<double> frame;
-    mx::improc::eigenImage<double> sum( m_sci.rows(), m_sci.cols() );
-    sum.setZero();
-    double psfMax = -std::numeric_limits<double>::infinity();
-
-    if( rv == 0 )
+inline int xlinqCal::plannedRefs( int nPoke ) const
+{
+    if( m_refEvery == 0 )
     {
-        m_sci.flush();
-        m_sciLastCnt0 = m_sci.cnt0();
+        return 0;
+    }
 
-        for( unsigned n = 0; n < m_psfDiscard && rv == 0; ++n )
+    int nRef = ( nPoke + m_refEvery - 1 ) / m_refEvery + 1;
+
+    if( m_psfUnsatLast >= m_pokeFirst && m_psfUnsatLast < m_pokeLast )
+    {
+        // One after the switch, and one before it unless a scheduled reference falls there
+        int nUnsat = m_psfUnsatLast - m_pokeFirst + 1;
+        nRef += 1 + ( nUnsat % m_refEvery != 0 ? 1 : 0 );
+    }
+
+    return nRef;
+}
+
+inline int xlinqCal::switchSegment( bool unsat )
+{
+    const std::string &filter = unsat ? m_psfFilter : m_psfOrig;
+
+    log( unsat ? "unsaturated segment: pokes " + std::to_string( m_pokeFirst ) + "-" +
+                     std::to_string( std::min( m_psfUnsatLast, m_pokeLast ) ) + " with " + m_psfWheel + " at " + filter
+               : "saturated segment: " + m_psfWheel + " back to " + filter );
+
+    m_wheelMoved = true; // from the command on, the wheel may be away from m_psfOrig
+
+    if( moveWheel( filter ) != 0 )
+    {
+        return -1;
+    }
+
+    m_atUnsat    = unsat;
+    m_wheelMoved = unsat;
+    m_firstAcq   = true; // the next acquisition discards the frame in progress and sci.nSettle more
+
+    return 0;
+}
+
+inline mx::improc::eigenImage<float> xlinqCal::speckleShape() const
+{
+    const int    nr = m_dmInitial.rows(), nc = m_dmInitial.cols();
+    const double ang = m_psfSpeckAngle * M_PI / 180.0;
+    const double n0 = m_psfSpeckSep * cos( ang ), n1 = m_psfSpeckSep * sin( ang );
+
+    mx::improc::eigenImage<float> shape( nr, nc );
+
+    for( int c = 0; c < nc; ++c )
+    {
+        for( int r = 0; r < nr; ++r )
         {
-            rv = waitSciFrame( nullptr, cnt0 );
+            double v = cos( 2 * M_PI * ( n0 * r / nr + n1 * c / nc ) );
+
+            if( m_psfSpeckCross )
+            {
+                v += cos( 2 * M_PI * ( -n1 * r / nr + n0 * c / nc ) );
+            }
+
+            shape( r, c ) = m_psfSpeckAmp * v;
+        }
+    }
+
+    return shape;
+}
+
+inline int xlinqCal::psfAverage( const mx::improc::eigenImage<float> &cmd,
+                                 bool                                 full,
+                                 mx::improc::eigenImage<double>      &mean,
+                                 double                              &maxv )
+{
+    int rv;
+
+    if( !( cmd == m_dmLast ).all() )
+    {
+        timingRecord rec     = newRecord();
+        rec[timingCol::poke] = -1;
+
+        if( ( rv = applyCommand( cmd, rec ) ) != 0 )
+        {
+            return rv;
+        }
+    }
+
+    m_sci.flush();
+    m_sciLastCnt0 = m_sci.cnt0();
+
+    uint64_t cnt0;
+
+    for( unsigned n = 0; n < 1 + m_psfDiscard; ++n )
+    {
+        if( ( rv = waitSciFrame( nullptr, cnt0 ) ) != 0 )
+        {
+            return rv;
+        }
+    }
+
+    mx::improc::eigenImage<double> frame;
+    mean.setZero( m_sci.rows(), m_sci.cols() );
+
+    for( unsigned n = 0; n < m_psfN; ++n )
+    {
+        if( ( rv = waitSciFrame( &frame, cnt0 ) ) != 0 )
+        {
+            return rv;
         }
 
-        for( unsigned n = 0; n < m_psfN && rv == 0; ++n )
+        mean += frame;
+        maxv = std::max( maxv, full ? frame.maxCoeff() : maxOutsideCore( frame ) );
+    }
+
+    mean /= static_cast<double>( m_psfN );
+
+    return 0;
+}
+
+inline int xlinqCal::takePsf( const std::string &suffix )
+{
+    const bool speck  = m_psfSpeckAmp > 0;
+    const int  nPlane = speck ? ( m_psfMove ? 6 : 3 ) : 1;
+
+    mx::improc::eigenImage<float> shape = speck ? speckleShape() : mx::improc::eigenImage<float>( m_dmInitial * 0 );
+    mx::improc::eigenImage<float> plus  = m_dmInitial + shape;
+    mx::improc::eigenImage<float> minus = m_dmInitial - shape;
+
+    // The sequence: DM sign (+1, -1, 0 for the reference) and plane; plane -1 moves the wheel to psf.filter.
+    // The DM ends at its reference, and changes once across the wheel move.
+    std::vector<std::pair<int, int>> steps;
+    if( m_psfMove )
+    {
+        if( speck )
         {
-            if( ( rv = waitSciFrame( &frame, cnt0 ) ) == 0 )
+            steps = { { 0, 3 }, { 1, 4 }, { -1, 5 } };
+        }
+        steps.push_back( { 0, -1 } );
+    }
+    if( speck )
+    {
+        steps.push_back( { -1, 2 } );
+        steps.push_back( { 1, 1 } );
+    }
+    steps.push_back( { 0, 0 } );
+
+    log( "taking PSF block: " + std::to_string( nPlane ) + " x " + std::to_string( m_psfN ) + " frames" +
+         ( m_psfMove ? ", " + m_psfWheel + " to " + m_psfFilter : std::string( " in place" ) ) +
+         ( speck ? ", with calibration speckles" : "" ) );
+
+    std::vector<mx::improc::eigenImage<double>> planes( nPlane );
+
+    // Max over the PSF-filter planes (the full frame if the wheel moved, else outside the core), and outside the
+    // core over the calibration-filter planes
+    double      psfMax = -std::numeric_limits<double>::infinity();
+    double      calMax = -std::numeric_limits<double>::infinity();
+    std::string psfBeg;
+    timespec    ts;
+    int         rv = 0;
+
+    for( const auto &st : steps )
+    {
+        if( st.second < 0 )
+        {
+            m_wheelMoved = true; // from the command on, the wheel may have moved
+
+            if( ( rv = moveWheel( m_psfFilter ) ) != 0 )
             {
-                sum += frame;
-                psfMax = std::max( psfMax, frame.maxCoeff() );
+                break;
             }
+
+            continue;
+        }
+
+        if( psfBeg.empty() )
+        {
+            clock_gettime( CLOCK_REALTIME, &ts );
+            psfBeg = isoTime( ts );
+        }
+
+        const mx::improc::eigenImage<float> &cmd   = st.first > 0 ? plus : ( st.first < 0 ? minus : m_dmInitial );
+        bool                                 atPsf = st.second < 3;
+        bool                                 full  = atPsf && m_psfMove;
+
+        if( ( rv = psfAverage( cmd, full, planes[st.second], atPsf ? psfMax : calMax ) ) != 0 )
+        {
+            break;
         }
     }
 
     clock_gettime( CLOCK_REALTIME, &ts );
     std::string psfEnd = isoTime( ts );
 
-    // Always put the wheel back, even if stopped or on error
-    if( moveWheel( m_psfOrig ) == 0 )
+    // Always restore the DM and put the wheel back, even if stopped or on error
+    if( rv != 0 || !( m_dmLast == m_dmInitial ).all() )
     {
-        m_wheelMoved = false;
+        restoreDm();
     }
-    else
+
+    if( m_wheelMoved )
     {
-        logError( "THE " + m_psfWheel + " FILTER WHEEL MAY NOT BE AT " + m_psfOrig + ": check it" );
-        rv = -1;
+        if( moveWheel( m_psfOrig ) == 0 )
+        {
+            m_wheelMoved = false;
+        }
+        else
+        {
+            logError( "THE " + m_psfWheel + " FILTER WHEEL MAY NOT BE AT " + m_psfOrig + ": check it" );
+            rv = -1;
+        }
     }
 
     if( rv != 0 )
@@ -2678,33 +3031,55 @@ inline int xlinqCal::takePsf( const std::string &suffix )
 
     if( m_sciLinearMax > 0 && psfMax > m_sciLinearMax )
     {
-        log( "warning: the PSF has pixels above sci.linearMax (" + std::to_string( psfMax ) +
-             "): choose a denser psf.filter" );
+        log( "warning: the PSF block has pixels " + std::string( m_psfMove ? "" : "outside the core " ) +
+             "above sci.linearMax (" + std::to_string( psfMax ) +
+             "): " + ( m_psfMove ? "choose a denser psf.filter" : "lower psf.speckAmp" ) );
     }
 
-    mx::improc::eigenImage<float> psf = ( sum / static_cast<double>( m_psfN ) ).cast<float>();
+    if( m_sciLinearMax > 0 && calMax > m_sciLinearMax )
+    {
+        log( "warning: the calibration speckles at " + m_psfOrig + " are above sci.linearMax (" +
+             std::to_string( calMax ) + "): lower psf.speckAmp, or raise sci.satRadius if it is the core" );
+    }
+
+    mx::improc::eigenCube<float> cube( m_sci.rows(), m_sci.cols(), nPlane );
+
+    for( int p = 0; p < nPlane; ++p )
+    {
+        cube.image( p ) = planes[p].cast<float>();
+    }
+
+    const char *what[3] = { "DM reference", "DM reference + speckles", "DM reference - speckles" };
 
     mx::fits::fitsHeader<> head = outputHeader( true );
-    head.append( "PRODUCT",
-                 std::string( "unsaturated PSF: mean of PSFN frames with PSFWHEEL at PSFFILT" ),
-                 "content of this cube" );
-    head.append( "PSFN", m_psfN, "frames averaged" ); // PSFWHEEL, PSFFILT, ORIGFILT are in outputHeader
-    head.append( "PSFBEG", psfBeg, "UTC wheel confirmed at PSFFILT" );
-    head.append( "PSFEND", psfEnd, "UTC last PSF frame" );
-    head.append( "PSFDISC", m_psfDiscard, "frames discarded after the wheel arrived" );
-    head.append( "PSFMAX", psfMax, "maximum pixel value in the PSF frames" );
+    head.append( "PRODUCT", std::string( "PSF block: means of PSFN frames, see PLANEn" ), "content of this cube" );
+    for( int p = 0; p < nPlane; ++p )
+    {
+        head.append( "PLANE" + std::to_string( p ),
+                     std::string( p < 3 ? m_psfFilter : m_psfOrig ) + ", " + what[p % 3],
+                     "filter, DM state" );
+    }
+    head.append( "PSFN", m_psfN, "frames averaged per plane" ); // PSFWHEEL, PSFFILT, ORIGFILT are in outputHeader
+    head.append( "PSFBEG", psfBeg, "UTC start of the first plane" );
+    head.append( "PSFEND", psfEnd, "UTC end of the last plane" );
+    head.append( "PSFDISC", m_psfDiscard, "frames discarded per change, beyond the one in progress" );
+    head.append( "PSFMAX", psfMax, m_psfMove ? "max pixel at PSFFILT" : "max pixel outside the core mask at PSFFILT" );
+    if( speck && m_psfMove )
+    {
+        head.append( "CALMAX", calMax, "max pixel outside the core mask at ORIGFILT" );
+    }
 
     std::string               file = outputPath( suffix );
     mx::fits::fitsFile<float> ff;
 
-    if( ff.write( file, psf, head ) != mx::error_t::noerror )
+    if( ff.write( file, cube, head ) != mx::error_t::noerror )
     {
         logError( "could not write " + file );
         return -1;
     }
 
     ++m_psfTaken;
-    log( "wrote PSF to " + file );
+    log( "wrote PSF block to " + file );
 
     return 0;
 }
@@ -2811,11 +3186,21 @@ inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
     }
     head.append( "NDARK", m_darkTaken, "frames in the dark (_dark.fits), 0 = none" );
     head.append( "NPSF", m_psfTaken, "unsaturated PSF blocks saved (_psf.fits, _psf_end.fits)" );
-    if( m_psfN > 0 )
+    head.append( "UNSATLST", m_psfUnsatLast, "pokes <= this at PSFFILT (unsaturated), -1 = none" );
+    head.append( "NREFUNS", m_nRefUnsat, "leading references at PSFFILT (unsaturated)" );
+    if( wheelNeeded() )
     {
         head.append( "PSFWHEEL", m_psfWheel, "filter wheel switched for the PSF" );
         head.append( "PSFFILT", m_psfFilter, "filter during the PSF" );
         head.append( "ORIGFILT", m_psfOrig, "filter during the calibration" );
+        head.append( "PSFMOVE", m_psfMove, "the wheel moved for the PSF blocks" );
+        head.append( "SPKAMP", m_psfSpeckAmp, "calibration speckle amplitude [um], 0 for none" );
+        if( m_psfSpeckAmp > 0 )
+        {
+            head.append( "SPKSEP", m_psfSpeckSep, "calibration speckle frequency [cycles across the DM]" );
+            head.append( "SPKANG", m_psfSpeckAngle, "calibration speckle angle [deg] from DM axis 1 to 2" );
+            head.append( "SPKCROSS", m_psfSpeckCross, "calibration speckles crossed (4 speckles)" );
+        }
     }
     head.append( "SATRAD", m_sciSatRadius, "core mask radius excluded from SCIMAX [px], 0 = none" );
     if( m_sciSatRadius > 0 )
@@ -2953,7 +3338,8 @@ inline int xlinqCal::writeOutput( bool final )
                                           "TEND",
                                           "SCIATIMA",
                                           "SCIATIMB",
-                                          "SCIMAX" };
+                                          "SCIMAX",
+                                          "UNSAT" };
 
     for( size_t j = 0; j < m_wfs.size(); ++j )
     {
