@@ -439,3 +439,29 @@ The try3 log holds three runs with the same prefix; the files are from the last 
   Unlike try2 (≈ 0.75, flat), R falls with radius. The causes are not separated yet: time variation within the run, bandwidth, and light from planes not conjugate to the DM.
 - **2f test:** both sides agree (16.9 ± 2.5 and 17.7 ± 3.8), which confirms the side sign with the coronagraph in. There is no DM 2f harmonic (|2f/fund| < 0.5% for |n| < 12). The fitted κ rises with |n|: 15.7 ± 1.2 (4–6), 18.3 ± 1.4 (6–8), 22.0 ± 1.0 (8–12), 26.6 ± 1.4 (12–18). See §9.15.
 - **Saturation:** one acquisition exceeded 37k (poke 16, + sign, 37,099).
+
+### 9.15 The DM response function g(n) (2026-11-21)
+**Method** (`tools/dm_response.py`).
+- **Energy measurement:** a 1 µm rms sinusoid commanded at a gives phase x√2 cos(ψ+θ) with x = G a, G = κ g(n). The speckle pair then holds 2 J₁(√2 G a)² of the PSF flux, which is (G a)² for small phase. Each pair's even-part energy is measured in apertures of radius 5 px, elongated radially by ±8% to collect the bandwidth smear, and normalized by the PSF energy within 5 px.
+- **Amplitude correction:** G is solved with the J₁ form, so data sets at different amplitudes compare directly.
+- **Definitions:** g = G/κ with κ = 4π/λ = 13.8 rad/µm is the DM's response to the commanded surface. Not for focal-plane-mask data.
+
+**Result.**
+
+| \|n\| | 3–4 | 4–5 | 5–6 | 6–8 | 8–10 | 10–12 | 12–14 | 14–16 | 16–18 | 18–20 | 20–22 | 22–25 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| g, try2 (a = 0.010–0.046 µm) | 1.00 | 0.99 | 0.95 | 0.90 | 0.82 | 0.74 | 0.64 | 0.54 | 0.46 | 0.38 | 0.31 | 0.25 |
+| g, try1 (a = 0.05 µm) | 0.97 | 0.97 | 0.95 | 0.90 | 0.82 | 0.73 | 0.62 | 0.53 | 0.44 | 0.36 | 0.30 | 0.23 |
+
+- **Linear, not amplitude-dependent:** after the J₁ correction, try1 and try2 agree within 0.5–3% out to |n| ≈ 14, despite amplitudes differing by up to 5×. Beyond that, try1 is 3–5% lower. This could be a small amplitude compression at high |n|, but the amplitudes there differ by less than 2×, so it is not established.
+- **Low order:** g ≈ 1 at |n| ≈ 3.5, so low-order commands are µm of surface, consistent with the `modevalWFS` gain ≈ 1 (§9.13).
+- **Fit:** G = κ₀ exp(−(f/f₀)^p) with f = |n|/50 cycles per actuator gives f₀ = 0.352, p = 1.51, κ₀ = 16.1 (try2), with a 2.9% rms fractional residual. κ₀ is the fit's extrapolation to f = 0, where there is no data (the cusp of p ≈ 1.5), so use the table or the per-mode values, not κ₀. A Gaussian influence function, exp(−α f²), fits worse (6%); it corresponds to σ = 0.55 pitch, or 19% nearest-neighbor coupling.
+- **Isotropic:** residuals do not depend on the direction of n (within 1%), so the response is isotropic.
+- **Lyot stop:** try3 gives 0.91 at low order, converging to try2 by |n| ≈ 18. The 5–9% low-order offset is unexplained; a candidate is that the speckle-to-PSF shape assumption is changed by the Lyot stop.
+
+**Closure with the 2f test.** The 2f fit returns G(n)²/G(2n) (§9.12). With the try2 fit, the predictions are 18.2, 19.9, 23.1 and 27.6, against try5's 15.7 ± 1.2, 18.3 ± 1.4, 22.0 ± 1.0 and 26.6 ± 1.4 for |n| = 4–6, 6–8, 8–12 and 12–18. First- and second-order measurements give the same response, which confirms it is the actual DM surface (or effective phase), not an aperture loss.
+
+**Consequences.**
+- The prediction pipeline (§9.13) must scale each Fourier coefficient by g(n). Commanded µm overstate the high-order surface by up to 4× near the DM Nyquist frequency. In the measured-response approach (regularized inverse of R_mv, then phase), the camsci1 side must use G(n), not κ.
+- Probe amplitudes for a target speckle contrast scale as 1/g(n); `shape_pokes.py`'s empirical energy law already includes this.
+- The per-mode table is in `try2/try2_dmresp.fits` (also try1, try3).
