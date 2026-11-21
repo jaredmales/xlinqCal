@@ -133,6 +133,17 @@ struct xlinqSimConfig
     std::string shutterFile; ///< If set, a file holding the shutter state: content starting "On" means shut (as
                              ///< MagAOX shutter.toggle). Read at the end of each camsci1 exposure.
 
+    double sciCoreAmp{ 0 }; ///< Peak of a Gaussian PSF core at the camsci1 center, above sciLevel [counts]. 0 for none.
+
+    double sciCoreSigma{ 2 }; ///< Gaussian sigma of the PSF core [px].
+
+    double sciSat{ 0 }; ///< camsci1 saturation level: pixel values are clipped here [counts]. 0 for none.
+
+    std::string attenFile; ///< If set, a file holding a filter state: content starting "On" scales the camsci1
+                           ///< light (everything above sciDark) by attenFactor, like an ND filter.
+
+    double attenFactor{ 0.01 }; ///< Light transmission with the attenFile filter in.
+
     double wfsGain{ 50 }; ///< rms camwfs response to a 1 micron rms poke [counts].
 
     double sciGain{ 50 }; ///< rms camsci1 response to a 1 micron rms poke [counts].
@@ -262,6 +273,9 @@ class xlinqSim
 
     /// True if the shutter file says the shutter is shut.
     bool shutterShut() const;
+
+    /// The light transmission set by attenFile: attenFactor if it says On, else 1.
+    double transmission() const;
 };
 
 inline simStream::~simStream()
@@ -602,6 +616,23 @@ inline void xlinqSim::sciThreadExec()
     mx::improc::eigenImage<float> pendingFrame( nPix, 1 );
     acc.setZero();
 
+    // The PSF core, fixed
+    mx::improc::eigenImage<float> core( m_cfg.sciRows, m_cfg.sciCols );
+    core.setZero();
+    if( m_cfg.sciCoreAmp > 0 )
+    {
+        double c0 = 0.5 * ( m_cfg.sciRows - 1 ), c1 = 0.5 * ( m_cfg.sciCols - 1 );
+        for( uint32_t c = 0; c < m_cfg.sciCols; ++c )
+        {
+            for( uint32_t r = 0; r < m_cfg.sciRows; ++r )
+            {
+                double r2    = ( r - c0 ) * ( r - c0 ) + ( c - c1 ) * ( c - c1 );
+                core( r, c ) = m_cfg.sciCoreAmp * exp( -0.5 * r2 / ( m_cfg.sciCoreSigma * m_cfg.sciCoreSigma ) );
+            }
+        }
+    }
+    Eigen::Map<const mx::improc::eigenImage<float>> coreVec( core.data(), nPix, 1 );
+
     typedef std::chrono::steady_clock::duration durT;
 
     durT sample    = std::chrono::duration_cast<durT>( std::chrono::duration<double>( 1.0 / m_cfg.sciSampleHz ) );
@@ -650,12 +681,15 @@ inline void xlinqSim::sciThreadExec()
             }
             else
             {
-                pendingFrame = ( level + acc / nSamp )
-                                   .unaryExpr(
-                                       [&]( float v )
-                                       {
-                                           return v + norm( gen );
-                                       } );
+                float t = static_cast<float>( transmission() );
+                pendingFrame =
+                    ( m_cfg.sciDark + t * ( level - m_cfg.sciDark + acc / nSamp + coreVec ) )
+                        .unaryExpr(
+                            [&]( float v )
+                            {
+                                v += norm( gen );
+                                return m_cfg.sciSat > 0 ? std::min( v, static_cast<float>( m_cfg.sciSat ) ) : v;
+                            } );
             }
             pending      = true;
             pendingAtime = realtimeNow();
@@ -679,6 +713,20 @@ inline bool xlinqSim::shutterShut() const
     fin >> state;
 
     return state.compare( 0, 2, "On" ) == 0;
+}
+
+inline double xlinqSim::transmission() const
+{
+    if( m_cfg.attenFile.empty() )
+    {
+        return 1;
+    }
+
+    std::ifstream fin( m_cfg.attenFile );
+    std::string   state;
+    fin >> state;
+
+    return state.compare( 0, 2, "On" ) == 0 ? m_cfg.attenFactor : 1;
 }
 
 inline double xlinqSim::elapsed() const

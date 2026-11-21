@@ -55,6 +55,7 @@ In `out.dir`, with prefix `<out.prefix>_<UTC timestamp>` (e.g. `xlinqCal_2026112
 | `<prefix>_snap_<name>_end.fits` | written only if that stream changed during the run (a warning is logged) |
 | `<prefix>_indi.txt`, `<prefix>_indi_end.txt` | with `indi.enable`: INDI state at the start and end, one `device.property.element=value` line per element (getINDI's format); unreadable properties are noted with `#` |
 | `<prefix>_camsci1_dark.fits` | with `dark.n` > 0: mean of `dark.n` camsci1 frames taken with the shutter shut after a complete run |
+| `<prefix>_camsci1_psf.fits`, `<prefix>_camsci1_psf_end.fits` | with `psf.n` > 0: mean of `psf.n` unsaturated camsci1 frames with the filter wheel at `psf.filter`, before the first poke and after a complete run (DM at its initial state) |
 | `<prefix>.log` | run log |
 
 `<cam>` is the stream name (`camsci1`, and each WFS stream). Headers record the configuration, stream names, datatypes, measured fps, poke range (`POKE0`, `NPOKE`), references (`REFEVERY`, `NREF`), the camsci1 linearity limit and count (`SCILINMX`, `NNONLIN`), the INDI exposure time and EM gain (`SCIEXPT`, `SCIEMGN`) and dark frame count (`NDARK`), `PRODUCT`, `COMPLETE`, and start/end times. Partial results are checkpointed every `out.checkpointMin` minutes.
@@ -72,6 +73,20 @@ xlinqCal is a minimal INDI client. It shells out to MagAO-X's `getINDI` and `set
   Once shut, the shutter is always commanded open again, also after a stop or error; if that can't be confirmed, the log says so loudly. A stopped or failed run takes no dark.
 - **MagAOX rules for INDI clients:** every get is one exact `device.property` (no wildcards, no device-wide or all-property requests). Every set is type-flagged. Each call has a wall-clock limit (`indi.timeout`), and readbacks are polled every `indi.poll` s (default 2, the MagAOX minimum).
 - **Reachability on RTC:** `camsci1` is visible through RTC's indiserver. `fwsci1`, `stagesci1`, and `camsci1-dark` need to be added to RTC's indiserver remotes before they can go in `indi.props`.
+
+## Saturated core with unsaturated PSFs
+
+At the default light level the camsci1 halo is read-noise limited. Opening up the ND filter by 10–100× raises the speckle SNR by about as much, at the cost of a saturated PSF core. The core doesn't matter for the speckles or the even part, but the PSF itself is still needed (photometry, speckle shape), so xlinqCal can take it unsaturated with the ND wheel:
+
+- **Core mask:** `sci.satRadius` [px] excludes a disk around the saturated core from the linearity check. The disk is centered on the preflight frame's pixels above `sci.linearMax`. `SCIMAX` (timing table) is then the maximum outside the mask, so blooming along columns or a brightening halo is still counted and warned. Headers: `SATRAD`, `SATCX`, `SATCY`.
+- **PSF blocks:** with `psf.n` > 0 (needs `indi.enable`), the preflight reads `<psf.wheel>.filterName` (default wheel `fwscind`). It refuses to start unless exactly one filter is On, that filter differs from `psf.filter` (default `ND3_0`), and the wheel is READY. Before the first poke, and again after a complete run, xlinqCal:
+  1. sets `<psf.wheel>.filterName.<psf.filter>=On` (`setINDI -s`) and waits until that element reads On and the wheel is READY (it only turns On at the new position, so a premature READY is not accepted);
+  2. discards `psf.discard` frames and averages `psf.n` frames into `_camsci1_psf.fits` (`_psf_end.fits`);
+  3. puts the wheel back to its original filter and confirms it. This always happens once the wheel was commanded, also after a stop or error; if it can't be confirmed, the log says so loudly.
+
+  A failed start block stops the run before any poke. A stopped or failed run takes no end block. The PSF header has `PSFFILT`, `ORIGFILT`, `PSFBEG`/`PSFEND`, and `PSFMAX` (warned if above `sci.linearMax`).
+- **EM gain guard:** with INDI on, xlinqCal refuses to run when a preflight frame is above `sci.linearMax` and `<sci.device>.emgain.current` > 1. Saturating with EM gain ages the EM register.
+- **Flux ratio:** the transmission ratio between the two filters is not taken from the ND label. Measure it from pixels that are unsaturated in both the PSF and the calibration references.
 
 ## Tools
 

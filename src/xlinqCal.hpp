@@ -170,6 +170,18 @@ class xlinqCal : public mx::app::application
 
     double m_darkWait{ 15 }; ///< Timeout [s] for the shutter to reach the requested state.
 
+    unsigned m_psfN{ 0 }; ///< camsci1 frames averaged per unsaturated PSF block (start and end), 0 for none.
+
+    std::string m_psfWheel{ "fwscind" }; ///< The INDI device of the filter wheel switched for the PSF.
+
+    std::string m_psfFilter{ "ND3_0" }; ///< The wheel's filterName element used for the PSF.
+
+    unsigned m_psfDiscard{ 2 }; ///< camsci1 frames discarded after the wheel arrives.
+
+    double m_psfWait{ 30 }; ///< Timeout [s] for the wheel to reach the requested filter.
+
+    double m_sciSatRadius{ 0 }; ///< Radius [px] of the core mask excluded from the linearity check, 0 for none.
+
     unsigned m_nRepeat{ 2 }; ///< Number of +/- pairs per poke, with alternating order.
 
     unsigned m_refEvery{ 1 }; ///< Pokes between zero-poke reference acquisitions, 0 disables references.
@@ -210,6 +222,18 @@ class xlinqCal : public mx::app::application
 
     unsigned m_darkTaken{ 0 }; ///< Frames in the saved dark, 0 if none.
 
+    std::string m_psfOrig; ///< The wheel's filter at the start, restored after each PSF block.
+
+    bool m_wheelMoved{ false }; ///< True if xlinqCal moved the wheel and has not confirmed it back at m_psfOrig.
+
+    int m_psfTaken{ 0 }; ///< Number of PSF blocks saved.
+
+    double m_sciCoreX{ 0 }; ///< Core mask center along the first image axis (FITS x) [px].
+
+    double m_sciCoreY{ 0 }; ///< Core mask center along the second image axis (FITS y) [px].
+
+    Eigen::Array<bool, -1, -1> m_coreMask; ///< True inside the core mask (sci.satRadius).
+
     std::vector<mx::improc::eigenImage<float>> m_snapStart; ///< Snapshot content at the start of measurement.
 
     isioStream m_comb; ///< The combined DM stream, with claimed semaphore.
@@ -243,6 +267,8 @@ class xlinqCal : public mx::app::application
     double m_sciFps{ 0 }; ///< camsci1 frame rate measured during preflight.
 
     double m_sciPreMax{ 0 }; ///< Maximum camsci1 pixel value in a frame read during preflight.
+
+    double m_sciPreMaxOut{ 0 }; ///< As m_sciPreMax, outside the core mask (equal to it without a mask).
 
     int m_nNonlin{ 0 }; ///< Number of acquisitions with a camsci1 frame above m_sciLinearMax.
 
@@ -506,6 +532,27 @@ class xlinqCal : public mx::app::application
      * \returns 0 on success, 1 if stopped, -1 on error
      */
     int takeDark();
+
+    /// Move the PSF filter wheel to a filter and wait until it is there.
+    /** Sends `<wheel>.filterName.<filter>=On` (setINDI -s), then polls every indi.poll seconds until that
+     * element reads On and `<wheel>.fsm.state` is READY, or psf.wait passes. The element follows the
+     * actual position (MagAOX stdMotionStage), so a READY reported before the move starts is not
+     * accepted.
+     * \returns 0 when there, -1 on error or timeout
+     */
+    int moveWheel( const std::string &filter /**< [in] the filterName element */ );
+
+    /// Take an unsaturated PSF: wheel to psf.filter, discard, average psf.n frames, wheel back, save.
+    /** The wheel is always commanded back to its original filter once moved, even on error or stop.
+     * \returns 0 on success, 1 if stopped, -1 on error
+     */
+    int takePsf( const std::string &suffix /**< [in] appended to the output prefix, e.g. _psf.fits */ );
+
+    /// Set the core mask from a frame: centered on the saturated pixels (or the maximum), radius sci.satRadius.
+    void setCoreMask( const mx::improc::eigenImage<double> &frame /**< [in] a camsci1 frame */ );
+
+    /// The maximum of a camsci1 frame outside the core mask.
+    double maxOutsideCore( const mx::improc::eigenImage<double> &frame /**< [in] a camsci1 frame */ ) const;
 
     /// Restore the DM channel to its initial content.
     void restoreDm();
@@ -918,6 +965,63 @@ inline void xlinqCal::setupConfig()
                 "float",
                 "Timeout for the shutter to reach the requested state [s]. Default 15." );
 
+    config.add( "psf.n",
+                "",
+                "psf.n",
+                argType::Required,
+                "psf",
+                "n",
+                false,
+                "int",
+                "Frames averaged for an unsaturated PSF taken before the first poke and after a complete run, with "
+                "the filter wheel psf.wheel at psf.filter; needs indi.enable. 0 for none. Default 0." );
+    config.add( "psf.wheel",
+                "",
+                "psf.wheel",
+                argType::Required,
+                "psf",
+                "wheel",
+                false,
+                "string",
+                "INDI device of the filter wheel switched for the PSF. Default fwscind." );
+    config.add( "psf.filter",
+                "",
+                "psf.filter",
+                argType::Required,
+                "psf",
+                "filter",
+                false,
+                "string",
+                "Filter (filterName element) of psf.wheel used for the PSF. Default ND3_0." );
+    config.add( "psf.discard",
+                "",
+                "psf.discard",
+                argType::Required,
+                "psf",
+                "discard",
+                false,
+                "int",
+                "Frames discarded after the wheel arrives. Default 2." );
+    config.add( "psf.wait",
+                "",
+                "psf.wait",
+                argType::Required,
+                "psf",
+                "wait",
+                false,
+                "float",
+                "Timeout for the wheel to reach the requested filter [s]. Default 30." );
+    config.add( "sci.satRadius",
+                "",
+                "sci.satRadius",
+                argType::Required,
+                "sci",
+                "satRadius",
+                false,
+                "float",
+                "Radius [px] of the saturated core excluded from the linearity check, centered on the saturated "
+                "pixels of a preflight frame. 0 for none. Default 0." );
+
     config.add( "seq.nRepeat",
                 "",
                 "seq.nRepeat",
@@ -1020,6 +1124,12 @@ inline void xlinqCal::loadConfig()
     config( m_darkN, "dark.n" );
     config( m_darkDiscard, "dark.discard" );
     config( m_darkWait, "dark.wait" );
+    config( m_psfN, "psf.n" );
+    config( m_psfWheel, "psf.wheel" );
+    config( m_psfFilter, "psf.filter" );
+    config( m_psfDiscard, "psf.discard" );
+    config( m_psfWait, "psf.wait" );
+    config( m_sciSatRadius, "sci.satRadius" );
 
     m_indi.commands( m_indiGet, m_indiSet );
     m_indi.timeout( m_indiTimeout );
@@ -1066,15 +1176,21 @@ inline int xlinqCal::execute()
         return -1;
     }
 
-    int rv = preflight();
-    if( rv != 0 )
+    if( m_psfN > 0 && !m_indiEnable )
     {
-        return rv;
+        logError( "psf.n > 0 needs indi.enable=true" );
+        return -1;
     }
 
     if( indiPreflight() < 0 )
     {
         return -1;
+    }
+
+    int rv = preflight();
+    if( rv != 0 )
+    {
+        return rv;
     }
 
     if( setupOutput() < 0 || savePokes() < 0 || saveStartSnapshots() < 0 )
@@ -1085,6 +1201,12 @@ inline int xlinqCal::execute()
     if( m_indiEnable && indiRecord( "_indi.txt", m_indiStart ) < 0 )
     {
         return -1;
+    }
+
+    if( m_psfN > 0 && ( rv = takePsf( "_" + m_sciName + "_psf.fits" ) ) != 0 )
+    {
+        logError( "no PSF at the start: run not started" );
+        return rv;
     }
 
     timespec ts;
@@ -1108,6 +1230,21 @@ inline int xlinqCal::execute()
     if( checkEndSnapshots() < 0 )
     {
         rv = -1;
+    }
+
+    if( m_psfN > 0 && rv == 0 )
+    {
+        int prv = takePsf( "_" + m_sciName + "_psf_end.fits" );
+
+        if( prv != 0 )
+        {
+            logError( "no PSF at the end" );
+            rv = prv;
+        }
+    }
+    else if( m_psfN > 0 )
+    {
+        log( "run did not complete: no PSF at the end" );
     }
 
     if( m_darkN > 0 && rv == 0 )
@@ -1368,6 +1505,15 @@ inline int xlinqCal::preflight()
         uint64_t                       cnt0;
         m_sci.copy( frame, cnt0 );
         m_sciPreMax = frame.maxCoeff();
+        setCoreMask( frame );
+        m_sciPreMaxOut = maxOutsideCore( frame );
+    }
+
+    if( m_sciLinearMax > 0 && m_sciPreMax > m_sciLinearMax && std::isfinite( m_sciEmgain ) && m_sciEmgain > 1 )
+    {
+        logError( m_sciName + " is above sci.linearMax with EM gain " + std::to_string( m_sciEmgain ) +
+                  ": saturating with EM gain > 1 ages the EM register; set EM gain to 1" );
+        return -1;
     }
 
     std::vector<int> signs         = signSequence( m_nRepeat );
@@ -1393,9 +1539,14 @@ inline int xlinqCal::preflight()
        << m_pokeAmp << " um rms\n";
     os << "  sci:     " << m_sciName << " " << m_sci.rows() << "x" << m_sci.cols() << " type " << (int)m_sci.datatype()
        << " at " << m_sciFps << " fps, max pixel " << m_sciPreMax;
+    if( m_sciSatRadius > 0 )
+    {
+        os << ", outside the core mask (r < " << m_sciSatRadius << " px at " << m_sciCoreX << ", " << m_sciCoreY << ") "
+           << m_sciPreMaxOut;
+    }
     if( m_sciLinearMax > 0 )
     {
-        os << " (linear limit " << m_sciLinearMax << ( m_sciPreMax > m_sciLinearMax ? ", EXCEEDED" : "" ) << ")";
+        os << " (linear limit " << m_sciLinearMax << ( m_sciPreMaxOut > m_sciLinearMax ? ", EXCEEDED" : "" ) << ")";
     }
     os << "\n";
     for( size_t j = 0; j < m_wfs.size(); ++j )
@@ -1414,6 +1565,11 @@ inline int xlinqCal::preflight()
                                   " shutter shut, then opened)"
                             : std::string( "no dark" ) )
            << "\n";
+    }
+    if( m_psfN > 0 )
+    {
+        os << "  psf:     " << m_psfN << " frames with " << m_psfWheel << " at " << m_psfFilter
+           << " before the first poke and after the run, then back to " << m_psfOrig << "\n";
     }
     os << "  output:  " << outputPath( "_*" ) << "\n";
     os << "  estimate: " << hours << " h, " << gbytes << " GB output";
@@ -1887,7 +2043,7 @@ inline int xlinqCal::acquire( bool                                         settl
 
         prev = cnt0;
         sciSum += frame;
-        sciMax = std::max( sciMax, frame.maxCoeff() );
+        sciMax = std::max( sciMax, maxOutsideCore( frame ) );
     }
 
     rec[timingCol::sciAtimeLast] = tsSec( atime );
@@ -2092,6 +2248,12 @@ inline std::vector<std::string> xlinqCal::indiPropList() const
         props.push_back( m_sciDevice + p );
     }
 
+    if( m_psfN > 0 )
+    {
+        props.push_back( m_psfWheel + ".fsm" );
+        props.push_back( m_psfWheel + ".filterName" );
+    }
+
     for( const std::string &p : m_indiProps )
     {
         if( std::find( props.begin(), props.end(), p ) == props.end() )
@@ -2134,6 +2296,71 @@ inline int xlinqCal::indiPreflight()
     }
 
     log( "INDI: " + m_sciDevice + " exposure time " + val + " s" );
+
+    if( m_indi.getElement( m_sciDevice + ".emgain.current", val, err ) == 0 )
+    {
+        m_sciEmgain = atof( val.c_str() );
+    }
+    else
+    {
+        log( "warning: INDI " + err );
+    }
+
+    if( m_psfN > 0 )
+    {
+        if( !indiClient::validName( m_psfWheel + ".filterName." + m_psfFilter, 2 ) )
+        {
+            logError( "invalid psf.wheel or psf.filter '" + m_psfWheel + "', '" + m_psfFilter + "'" );
+            return -1;
+        }
+
+        std::map<std::string, std::string> elems;
+        std::string                        raw;
+
+        if( m_indi.getProperty( m_psfWheel + ".filterName", elems, raw, err ) < 0 )
+        {
+            logError( "INDI filter wheel check failed: " + err );
+            return -1;
+        }
+
+        if( elems.find( m_psfFilter ) == elems.end() )
+        {
+            logError( m_psfWheel + " has no filter " + m_psfFilter );
+            return -1;
+        }
+
+        m_psfOrig.clear();
+        int nOn = 0;
+        for( const auto &e : elems )
+        {
+            if( e.second == "On" )
+            {
+                m_psfOrig = e.first;
+                ++nOn;
+            }
+        }
+
+        if( nOn != 1 )
+        {
+            logError( m_psfWheel + ".filterName has " + std::to_string( nOn ) + " filters On: is it moving?" );
+            return -1;
+        }
+
+        if( m_psfOrig == m_psfFilter )
+        {
+            logError( m_psfWheel + " is already at psf.filter=" + m_psfFilter +
+                      ": set the wheel for the (saturated) calibration first" );
+            return -1;
+        }
+
+        if( m_indi.getElement( m_psfWheel + ".fsm.state", val, err ) < 0 || val != "READY" )
+        {
+            logError( m_psfWheel + " is not READY (" + ( err.empty() ? val : err ) + ")" );
+            return -1;
+        }
+
+        log( "INDI: " + m_psfWheel + " at " + m_psfOrig + ", PSF with " + m_psfFilter );
+    }
 
     if( m_darkN == 0 )
     {
@@ -2357,6 +2584,191 @@ inline int xlinqCal::takeDark()
     return 0;
 }
 
+inline int xlinqCal::moveWheel( const std::string &filter )
+{
+    std::string err;
+
+    if( m_indi.setSwitch( m_psfWheel + ".filterName." + filter, true, err ) < 0 )
+    {
+        logError( "filter wheel command failed: " + err );
+        return -1;
+    }
+
+    double tEnd = nowSec() + m_psfWait;
+
+    while( true )
+    {
+        std::this_thread::sleep_for( std::chrono::duration<double>( m_indiPoll ) );
+
+        std::map<std::string, std::string> elems;
+        std::string                        raw, state;
+
+        if( m_indi.getProperty( m_psfWheel + ".filterName", elems, raw, err ) == 0 && elems[filter] == "On" &&
+            m_indi.getElement( m_psfWheel + ".fsm.state", state, err ) == 0 && state == "READY" )
+        {
+            log( m_psfWheel + " at " + filter );
+            return 0;
+        }
+
+        if( nowSec() > tEnd )
+        {
+            logError( m_psfWheel + " did not reach " + filter + " within psf.wait" +
+                      ( err.empty() ? "" : ": " + err ) );
+            return -1;
+        }
+    }
+}
+
+inline int xlinqCal::takePsf( const std::string &suffix )
+{
+    log( "taking PSF: " + std::to_string( m_psfN ) + " frames with " + m_psfWheel + " at " + m_psfFilter );
+
+    m_wheelMoved = true; // from the command on, the wheel may have moved
+
+    int rv = moveWheel( m_psfFilter );
+
+    timespec ts;
+    clock_gettime( CLOCK_REALTIME, &ts );
+    std::string psfBeg = isoTime( ts );
+
+    uint64_t                       cnt0;
+    mx::improc::eigenImage<double> frame;
+    mx::improc::eigenImage<double> sum( m_sci.rows(), m_sci.cols() );
+    sum.setZero();
+    double psfMax = -std::numeric_limits<double>::infinity();
+
+    if( rv == 0 )
+    {
+        m_sci.flush();
+        m_sciLastCnt0 = m_sci.cnt0();
+
+        for( unsigned n = 0; n < m_psfDiscard && rv == 0; ++n )
+        {
+            rv = waitSciFrame( nullptr, cnt0 );
+        }
+
+        for( unsigned n = 0; n < m_psfN && rv == 0; ++n )
+        {
+            if( ( rv = waitSciFrame( &frame, cnt0 ) ) == 0 )
+            {
+                sum += frame;
+                psfMax = std::max( psfMax, frame.maxCoeff() );
+            }
+        }
+    }
+
+    clock_gettime( CLOCK_REALTIME, &ts );
+    std::string psfEnd = isoTime( ts );
+
+    // Always put the wheel back, even if stopped or on error
+    if( moveWheel( m_psfOrig ) == 0 )
+    {
+        m_wheelMoved = false;
+    }
+    else
+    {
+        logError( "THE " + m_psfWheel + " FILTER WHEEL MAY NOT BE AT " + m_psfOrig + ": check it" );
+        rv = -1;
+    }
+
+    if( rv != 0 )
+    {
+        return rv;
+    }
+
+    if( m_sciLinearMax > 0 && psfMax > m_sciLinearMax )
+    {
+        log( "warning: the PSF has pixels above sci.linearMax (" + std::to_string( psfMax ) +
+             "): choose a denser psf.filter" );
+    }
+
+    mx::improc::eigenImage<float> psf = ( sum / static_cast<double>( m_psfN ) ).cast<float>();
+
+    mx::fits::fitsHeader<> head = outputHeader( true );
+    head.append( "PRODUCT",
+                 std::string( "unsaturated PSF: mean of PSFN frames with PSFWHEEL at PSFFILT" ),
+                 "content of this cube" );
+    head.append( "PSFN", m_psfN, "frames averaged" ); // PSFWHEEL, PSFFILT, ORIGFILT are in outputHeader
+    head.append( "PSFBEG", psfBeg, "UTC wheel confirmed at PSFFILT" );
+    head.append( "PSFEND", psfEnd, "UTC last PSF frame" );
+    head.append( "PSFDISC", m_psfDiscard, "frames discarded after the wheel arrived" );
+    head.append( "PSFMAX", psfMax, "maximum pixel value in the PSF frames" );
+
+    std::string               file = outputPath( suffix );
+    mx::fits::fitsFile<float> ff;
+
+    if( ff.write( file, psf, head ) != mx::error_t::noerror )
+    {
+        logError( "could not write " + file );
+        return -1;
+    }
+
+    ++m_psfTaken;
+    log( "wrote PSF to " + file );
+
+    return 0;
+}
+
+inline void xlinqCal::setCoreMask( const mx::improc::eigenImage<double> &frame )
+{
+    m_coreMask.setConstant( frame.rows(), frame.cols(), false );
+
+    if( m_sciSatRadius <= 0 )
+    {
+        return;
+    }
+
+    // Center on the pixels above the linearity limit, or on the maximum if none
+    double sx = 0, sy = 0, sw = 0;
+
+    if( m_sciLinearMax > 0 )
+    {
+        for( int c = 0; c < frame.cols(); ++c )
+        {
+            for( int r = 0; r < frame.rows(); ++r )
+            {
+                if( frame( r, c ) > m_sciLinearMax )
+                {
+                    sx += r;
+                    sy += c;
+                    sw += 1;
+                }
+            }
+        }
+    }
+
+    if( sw > 0 )
+    {
+        m_sciCoreX = sx / sw;
+        m_sciCoreY = sy / sw;
+    }
+    else
+    {
+        int r, c;
+        frame.maxCoeff( &r, &c );
+        m_sciCoreX = r;
+        m_sciCoreY = c;
+    }
+
+    for( int c = 0; c < frame.cols(); ++c )
+    {
+        for( int r = 0; r < frame.rows(); ++r )
+        {
+            m_coreMask( r, c ) = std::hypot( r - m_sciCoreX, c - m_sciCoreY ) < m_sciSatRadius;
+        }
+    }
+}
+
+inline double xlinqCal::maxOutsideCore( const mx::improc::eigenImage<double> &frame ) const
+{
+    if( m_sciSatRadius <= 0 || m_coreMask.rows() != frame.rows() || m_coreMask.cols() != frame.cols() )
+    {
+        return frame.maxCoeff();
+    }
+
+    return m_coreMask.select( -std::numeric_limits<double>::infinity(), frame ).maxCoeff();
+}
+
 inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
 {
     std::string seq;
@@ -2398,6 +2810,19 @@ inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
         head.append( "SCIEMGN", m_sciEmgain, "sci EM gain from INDI at start" );
     }
     head.append( "NDARK", m_darkTaken, "frames in the dark (_dark.fits), 0 = none" );
+    head.append( "NPSF", m_psfTaken, "unsaturated PSF blocks saved (_psf.fits, _psf_end.fits)" );
+    if( m_psfN > 0 )
+    {
+        head.append( "PSFWHEEL", m_psfWheel, "filter wheel switched for the PSF" );
+        head.append( "PSFFILT", m_psfFilter, "filter during the PSF" );
+        head.append( "ORIGFILT", m_psfOrig, "filter during the calibration" );
+    }
+    head.append( "SATRAD", m_sciSatRadius, "core mask radius excluded from SCIMAX [px], 0 = none" );
+    if( m_sciSatRadius > 0 )
+    {
+        head.append( "SATCX", m_sciCoreX, "core mask center, first image axis [px]" );
+        head.append( "SATCY", m_sciCoreY, "core mask center, second image axis [px]" );
+    }
     head.append( "NSNAP", (int)m_snapNames.size(), "number of snapshot streams" );
 
     for( size_t j = 0; j < m_snapNames.size(); ++j )

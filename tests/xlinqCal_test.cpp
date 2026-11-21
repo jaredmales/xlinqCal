@@ -621,7 +621,11 @@ struct fakeIndi
              "echo \"$1 $arg\" >> '"
           << ( dir / "setlog" ).string()
           << "'\n"
-             "( sleep 0.3; echo \"$val\" > \"$S/../tmp.$$\" && mv \"$S/../tmp.$$\" \"$S/$dpe\" ) >/dev/null 2>&1 &\n";
+             "prop=\"${dpe%.*}\"\n"
+             // A one-of-many switch (marked by a 1ofmany.<device.property> file) turns its other elements Off
+             "( sleep 0.3; if [ \"$val\" = On ] && [ -e \"$S/1ofmany.$prop\" ]; then for f in \"$S/$prop\".*; do "
+             "echo Off > \"$S/../tmp.$$\" && mv \"$S/../tmp.$$\" \"$f\"; done; fi; "
+             "echo \"$val\" > \"$S/../tmp.$$\" && mv \"$S/../tmp.$$\" \"$S/$dpe\" ) >/dev/null 2>&1 &\n";
         s.close();
 
         std::filesystem::permissions( getCmd, std::filesystem::perms::owner_all );
@@ -631,6 +635,12 @@ struct fakeIndi
     void set( const std::string &dpe, const std::string &val )
     {
         std::ofstream( state / dpe ) << val << "\n";
+    }
+
+    /// Mark `device.property` as a one-of-many switch.
+    void oneOfMany( const std::string &dp )
+    {
+        std::ofstream( state / ( "1ofmany." + dp ) ) << "\n";
     }
 
     std::string get( const std::string &dpe ) const
@@ -796,6 +806,191 @@ TEST_CASE( "xlinqCal records INDI state and takes a dark", "[xlinqCal][integrati
         auto [rv, nDone] = runApp( "noindi", { "--dark.n=3", "--indi.enable=false" } );
         REQUIRE( rv == -1 );
         REQUIRE( nDone == 0 );
+        REQUIRE( indi.lines( "getlog" ).empty() );
+    }
+
+    sim.stop();
+    std::filesystem::remove_all( dir );
+}
+
+/// With a saturated core, xlinqCal takes unsaturated PSFs with the ND wheel at the start and end, puts the wheel
+/// back each time, and excludes the core from the linearity check. It refuses to saturate with EM gain > 1.
+TEST_CASE( "xlinqCal takes unsaturated PSFs with the ND wheel", "[xlinqCal][integration][indi]" )
+{
+    using namespace xlinqCal;
+
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / ( xlinqCalTest::testPrefix() + "psf_out" );
+    std::filesystem::create_directories( dir );
+    xlinqCalTest::fakeIndi indi( dir / "indi" );
+
+    const std::string dev   = "xlsimcam";
+    const std::string wheel = "xlsimfw";
+    indi.set( dev + ".fsm.state", "READY" );
+    indi.set( dev + ".exptime.current", "0.05" );
+    indi.set( dev + ".emgain.current", "1" );
+    indi.set( dev + ".shutter_status.status", "READY" );
+    indi.set( dev + ".shutter.toggle", "Off" );
+    indi.set( wheel + ".fsm.state", "READY" );
+    indi.set( wheel + ".filterName.open", "Off" );
+    indi.set( wheel + ".filterName.ND1_0", "On" );
+    indi.set( wheel + ".filterName.ND3_0", "Off" );
+    indi.oneOfMany( wheel + ".filterName" );
+
+    xlinqSimConfig cfg;
+    cfg.prefix       = xlinqCalTest::testPrefix() + "psf_";
+    cfg.dmChannel    = cfg.prefix + "dm01disp04";
+    cfg.dmComb       = cfg.prefix + "dm01disp";
+    cfg.wfsName      = cfg.prefix + "camwfs";
+    cfg.sciName      = cfg.prefix + "camsci1";
+    cfg.wfsFps       = 1000;
+    cfg.sciFps       = 20;
+    cfg.sciPostDelay = 0.015;
+    cfg.sciCoreAmp   = 60000;
+    cfg.sciCoreSigma = 1.5;
+    cfg.sciSat       = 50000;
+    cfg.attenFile    = ( indi.state / ( wheel + ".filterName.ND3_0" ) ).string();
+    cfg.attenFactor  = 0.01;
+
+    mx::improc::eigenCube<float> pokes    = xlinqSim::randomPokes( cfg.dmRows, cfg.dmCols, 2, 3 );
+    std::string                  pokeFile = ( dir / "pokes.fits" ).string();
+    mx::fits::fitsFile<float>    ff;
+    REQUIRE( ff.write( pokeFile, pokes ) == mx::error_t::noerror );
+
+    xlinqSim sim( cfg );
+    sim.start();
+
+    struct result
+    {
+        int rv;
+        int nDone;
+        int nNonlin;
+    };
+
+    auto runApp = [&]( const std::string &prefix, std::vector<std::string> extra )
+    {
+        std::vector<std::string> args = { "xlinqCal",
+                                          "--dm.channel=" + cfg.dmChannel,
+                                          "--dm.comb=" + cfg.dmComb,
+                                          "--sci.shmim=" + cfg.sciName,
+                                          "--wfs.shmim=" + cfg.wfsName,
+                                          "--poke.file=" + pokeFile,
+                                          "--poke.amp=0.1",
+                                          "--sci.nFrames=2",
+                                          "--preflight.time=0.3",
+                                          "--out.dir=" + dir.string(),
+                                          "--out.prefix=" + prefix,
+                                          "--out.timestamp=false",
+                                          "--indi.enable=true",
+                                          "--indi.get=" + indi.getCmd,
+                                          "--indi.set=" + indi.setCmd,
+                                          "--indi.poll=0.2",
+                                          "--sci.device=" + dev,
+                                          "--sci.linearMax=37000",
+                                          "--yes" };
+        args.insert( args.end(), extra.begin(), extra.end() );
+
+        std::vector<char *> argv;
+        for( std::string &a : args )
+        {
+            argv.push_back( a.data() );
+        }
+
+        xlinqCal::xlinqCal app;
+        int                rv = app.main( argv.size(), argv.data() );
+        return result{ rv, app.nDone(), app.nNonlin() };
+    };
+
+    const std::vector<std::string> psfArgs = {
+        "--psf.n=3", "--psf.wheel=" + wheel, "--psf.filter=ND3_0", "--psf.discard=1", "--sci.satRadius=4" };
+
+    SECTION( "saturated run with PSFs at the start and end" )
+    {
+        result r = runApp( "psf", psfArgs );
+        REQUIRE( r.rv == 0 );
+        REQUIRE( r.nDone == 2 );
+        REQUIRE( r.nNonlin == 0 ); // the saturated core is masked
+
+        // Both PSFs are unsaturated, attenuated copies of the core
+        double expectPeak =
+            cfg.sciDark + cfg.attenFactor * ( cfg.sciLevel - cfg.sciDark + cfg.sciCoreAmp * exp( -0.25 / 2.25 ) );
+        for( const std::string suf : { "_psf.fits", "_psf_end.fits" } )
+        {
+            mx::improc::eigenImage<float> psf;
+            mx::fits::fitsHeader<>        head;
+            INFO( suf );
+            REQUIRE( ff.read( psf, head, ( dir / ( "psf_" + cfg.sciName + suf ) ).string() ) == mx::error_t::noerror );
+            REQUIRE( psf.maxCoeff() == Approx( expectPeak ).epsilon( 0.05 ) );
+            REQUIRE( head["PSFFILT"].value<std::string>().substr( 0, 5 ) == "ND3_0" );
+            REQUIRE( head["ORIGFILT"].value<std::string>().substr( 0, 5 ) == "ND1_0" );
+            REQUIRE( head["PSFMAX"].value<double>() < 37000 );
+        }
+
+        // The calibration frames are saturated, and the header records the mask and the PSFs
+        mx::improc::eigenCube<float> ref;
+        mx::fits::fitsHeader<>       head;
+        REQUIRE( ff.read( ref, head, ( dir / ( "psf_" + cfg.sciName + "_ref.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        REQUIRE( ref.image( 0 ).maxCoeff() == Approx( cfg.sciSat ).epsilon( 0.01 ) );
+        REQUIRE( head["NPSF"].value<int>() == 2 );
+        REQUIRE( head["SATRAD"].value<double>() == 4 );
+        REQUIRE( head["SATCX"].value<double>() == Approx( 5.5 ) );
+        REQUIRE( head["SATCY"].value<double>() == Approx( 5.5 ) );
+
+        // The wheel is back, after exactly two typed round trips
+        REQUIRE( indi.get( wheel + ".filterName.ND1_0" ) == "On" );
+        REQUIRE( indi.get( wheel + ".filterName.ND3_0" ) == "Off" );
+        std::vector<std::string> sets = indi.lines( "setlog" );
+        REQUIRE( sets.size() == 4 );
+        for( size_t i = 0; i < sets.size(); ++i )
+        {
+            REQUIRE( sets[i] == "-s " + wheel + ".filterName." + ( i % 2 == 0 ? "ND3_0" : "ND1_0" ) + "=On" );
+        }
+
+        // The wheel state is in the INDI record, and every get was one exact device.property
+        std::ifstream     fin( dir / "psf_indi.txt" );
+        std::stringstream ss;
+        ss << fin.rdbuf();
+        REQUIRE( ss.str().find( wheel + ".filterName.ND1_0=On" ) != std::string::npos );
+        for( const std::string &g : indi.lines( "getlog" ) )
+        {
+            INFO( g );
+            REQUIRE( indiClient::validName( g, 1 ) );
+        }
+    }
+
+    SECTION( "without the core mask the saturated core is counted" )
+    {
+        result r = runApp( "nomask", {} );
+        REQUIRE( r.rv == 0 );
+        REQUIRE( r.nNonlin > 0 );
+        REQUIRE( indi.lines( "setlog" ).empty() );
+    }
+
+    SECTION( "refuses when the wheel is already at the PSF filter" )
+    {
+        indi.set( wheel + ".filterName.ND1_0", "Off" );
+        indi.set( wheel + ".filterName.ND3_0", "On" );
+        result r = runApp( "atpsf", psfArgs );
+        REQUIRE( r.rv == -1 );
+        REQUIRE( r.nDone == 0 );
+        REQUIRE( indi.lines( "setlog" ).empty() );
+    }
+
+    SECTION( "refuses to saturate with EM gain above 1" )
+    {
+        indi.set( dev + ".emgain.current", "10" );
+        result r = runApp( "emgain", psfArgs );
+        REQUIRE( r.rv == -1 );
+        REQUIRE( r.nDone == 0 );
+        REQUIRE( indi.lines( "setlog" ).empty() );
+    }
+
+    SECTION( "a PSF needs indi.enable" )
+    {
+        std::vector<std::string> a = psfArgs;
+        a.push_back( "--indi.enable=false" );
+        result r = runApp( "noindi", a );
+        REQUIRE( r.rv == -1 );
         REQUIRE( indi.lines( "getlog" ).empty() );
     }
 
