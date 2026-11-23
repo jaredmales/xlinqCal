@@ -139,6 +139,9 @@ struct xlinqSimConfig
 
     double sciSat{ 0 }; ///< camsci1 saturation level: pixel values are clipped here [counts]. 0 for none.
 
+    int sciBleed{ 0 }; ///< Saturation bleed [px]: in each column, the pixels past the last saturated one along the
+                       ///< first image axis are saturated too, like camsci1's bleed stripe. 0 for none.
+
     std::string attenFile; ///< If set, a file holding a filter state: content starting "On" scales the camsci1
                            ///< light (everything above sciDark) by attenFactor, like an ND filter.
 
@@ -690,6 +693,27 @@ inline void xlinqSim::sciThreadExec()
                                 v += norm( gen );
                                 return m_cfg.sciSat > 0 ? std::min( v, static_cast<float>( m_cfg.sciSat ) ) : v;
                             } );
+
+                if( m_cfg.sciSat > 0 && m_cfg.sciBleed > 0 )
+                {
+                    const float sat = static_cast<float>( m_cfg.sciSat );
+                    for( uint32_t c = 0; c < m_cfg.sciCols; ++c )
+                    {
+                        float *col  = pendingFrame.data() + c * m_cfg.sciRows;
+                        int    last = -1;
+                        for( uint32_t r = 0; r < m_cfg.sciRows; ++r )
+                        {
+                            if( col[r] >= sat )
+                            {
+                                last = r;
+                            }
+                        }
+                        for( int r = last + 1; last >= 0 && r <= last + m_cfg.sciBleed && r < (int)m_cfg.sciRows; ++r )
+                        {
+                            col[r] = sat;
+                        }
+                    }
+                }
             }
             pending      = true;
             pendingAtime = realtimeNow();

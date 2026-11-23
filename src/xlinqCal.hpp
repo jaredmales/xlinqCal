@@ -250,6 +250,8 @@ class xlinqCal : public mx::app::application
 
     double m_sciCoreY{ 0 }; ///< Core mask center along the second image axis (FITS y) [px].
 
+    bool m_sciCoreFromPsf{ false }; ///< True once the core mask is centered on an unsaturated PSF block.
+
     Eigen::Array<bool, -1, -1> m_coreMask; ///< True inside the core mask (sci.satRadius).
 
     std::vector<mx::improc::eigenImage<float>> m_snapStart; ///< Snapshot content at the start of measurement.
@@ -595,6 +597,13 @@ class xlinqCal : public mx::app::application
 
     /// Set the core mask from a frame: centered on the saturated pixels (or the maximum), radius sci.satRadius.
     void setCoreMask( const mx::improc::eigenImage<double> &frame /**< [in] a camsci1 frame */ );
+
+    /// Recenter the core mask on an unsaturated PSF: the centroid of the pixels above half its maximum (above the
+    /// median background). Saturated pixels and their bleed bias the center of setCoreMask.
+    void recenterCore( const mx::improc::eigenImage<double> &psf /**< [in] the PSF-filter reference plane */ );
+
+    /// Fill the core mask: radius sci.satRadius about (m_sciCoreX, m_sciCoreY).
+    void fillCoreMask( int rows /**< [in] frame rows */, int cols /**< [in] frame columns */ );
 
     /// The maximum of a camsci1 frame outside the core mask.
     double maxOutsideCore( const mx::improc::eigenImage<double> &frame /**< [in] a camsci1 frame */ ) const;
@@ -3042,6 +3051,13 @@ inline int xlinqCal::takePsf( const std::string &suffix )
              std::to_string( calMax ) + "): lower psf.speckAmp, or raise sci.satRadius if it is the core" );
     }
 
+    // The unsaturated PSF centers the core mask for the rest of the run; the saturated pixels and their bleed
+    // don't (the bleed shifted the center 9 px in try6)
+    if( m_psfMove && m_sciSatRadius > 0 && !( m_sciLinearMax > 0 && psfMax > m_sciLinearMax ) )
+    {
+        recenterCore( planes[0] );
+    }
+
     mx::improc::eigenCube<float> cube( m_sci.rows(), m_sci.cols(), nPlane );
 
     for( int p = 0; p < nPlane; ++p )
@@ -3125,13 +3141,61 @@ inline void xlinqCal::setCoreMask( const mx::improc::eigenImage<double> &frame )
         m_sciCoreY = c;
     }
 
-    for( int c = 0; c < frame.cols(); ++c )
+    fillCoreMask( frame.rows(), frame.cols() );
+}
+
+inline void xlinqCal::fillCoreMask( int rows, int cols )
+{
+    m_coreMask.setConstant( rows, cols, false );
+
+    for( int c = 0; c < cols; ++c )
     {
-        for( int r = 0; r < frame.rows(); ++r )
+        for( int r = 0; r < rows; ++r )
         {
             m_coreMask( r, c ) = std::hypot( r - m_sciCoreX, c - m_sciCoreY ) < m_sciSatRadius;
         }
     }
+}
+
+inline void xlinqCal::recenterCore( const mx::improc::eigenImage<double> &psf )
+{
+    std::vector<double> v( psf.data(), psf.data() + psf.size() );
+    std::nth_element( v.begin(), v.begin() + v.size() / 2, v.end() );
+    double bg   = v[v.size() / 2];
+    double half = 0.5 * ( psf.maxCoeff() - bg );
+
+    if( !( half > 0 ) )
+    {
+        return;
+    }
+
+    // The pixels above half maximum are a symmetric selection, so the centroid is not biased by the pixel grid
+    double sx = 0, sy = 0, sw = 0;
+
+    for( int c = 0; c < psf.cols(); ++c )
+    {
+        for( int r = 0; r < psf.rows(); ++r )
+        {
+            double w = psf( r, c ) - bg;
+            if( w > half )
+            {
+                sx += w * r;
+                sy += w * c;
+                sw += w;
+            }
+        }
+    }
+
+    double x0 = m_sciCoreX, y0 = m_sciCoreY;
+    m_sciCoreX       = sx / sw;
+    m_sciCoreY       = sy / sw;
+    m_sciCoreFromPsf = true;
+    fillCoreMask( psf.rows(), psf.cols() );
+
+    std::ostringstream os;
+    os << "core mask centered on the PSF at (" << m_sciCoreX << ", " << m_sciCoreY << "), "
+       << std::hypot( m_sciCoreX - x0, m_sciCoreY - y0 ) << " px from the previous center";
+    log( os.str() );
 }
 
 inline double xlinqCal::maxOutsideCore( const mx::improc::eigenImage<double> &frame ) const
@@ -3207,6 +3271,7 @@ inline mx::fits::fitsHeader<> xlinqCal::outputHeader( bool final )
     {
         head.append( "SATCX", m_sciCoreX, "core mask center, first image axis [px]" );
         head.append( "SATCY", m_sciCoreY, "core mask center, second image axis [px]" );
+        head.append( "SATCPSF", m_sciCoreFromPsf ? 1 : 0, "1: core mask centered on the PSF, 0: on saturation" );
     }
     head.append( "NSNAP", (int)m_snapNames.size(), "number of snapshot streams" );
 

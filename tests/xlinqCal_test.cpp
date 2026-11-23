@@ -815,8 +815,8 @@ TEST_CASE( "xlinqCal records INDI state and takes a dark", "[xlinqCal][integrati
 
 /// With a saturated core, xlinqCal takes unsaturated PSFs with the ND wheel at the start and end, with +/- calibration
 /// speckles at both filters whose ratio is the transmission, puts the wheel back each time, and excludes the core
-/// from the linearity check. Already at the PSF filter, it takes the block in place. It refuses to saturate with
-/// EM gain > 1.
+/// from the linearity check. The PSF centers the core mask, which the bleed stripe pulls off center. Already at the
+/// PSF filter, it takes the block in place. It refuses to saturate with EM gain > 1.
 TEST_CASE( "xlinqCal takes unsaturated PSFs with the ND wheel", "[xlinqCal][integration][indi]" )
 {
     using namespace xlinqCal;
@@ -850,6 +850,7 @@ TEST_CASE( "xlinqCal takes unsaturated PSFs with the ND wheel", "[xlinqCal][inte
     cfg.sciCoreAmp   = 60000;
     cfg.sciCoreSigma = 1.5;
     cfg.sciSat       = 50000;
+    cfg.sciBleed     = 3; // puts the saturated-pixel center at (7, 5.5), 1.5 px from the core
     cfg.attenFile    = ( indi.state / ( wheel + ".filterName.ND3_0" ) ).string();
     cfg.attenFactor  = 0.01;
     cfg.sciQuadGain  = 200; // the calibration speckle intensity
@@ -973,8 +974,9 @@ TEST_CASE( "xlinqCal takes unsaturated PSFs with the ND wheel", "[xlinqCal][inte
         REQUIRE( ref.image( 0 ).maxCoeff() == Approx( cfg.sciSat ).epsilon( 0.01 ) );
         REQUIRE( head["NPSF"].value<int>() == 2 );
         REQUIRE( head["SATRAD"].value<double>() == 4 );
-        REQUIRE( head["SATCX"].value<double>() == Approx( 5.5 ) );
-        REQUIRE( head["SATCY"].value<double>() == Approx( 5.5 ) );
+        REQUIRE( head["SATCX"].value<double>() == Approx( 5.5 ).margin( 0.05 ) ); // on the PSF, not the bleed
+        REQUIRE( head["SATCY"].value<double>() == Approx( 5.5 ).margin( 0.05 ) );
+        REQUIRE( head["SATCPSF"].value<int>() == 1 );
 
         // The wheel is back, after exactly two typed round trips
         REQUIRE( indi.get( wheel + ".filterName.ND1_0" ) == "On" );
