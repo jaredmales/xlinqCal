@@ -46,6 +46,12 @@ def main():
     ap.add_argument("--png", help="optional PNG of the pupil amplitude and phase")
     ap.add_argument("--fit-center", action="store_true", help="fit the optical axis (focal-plane mask in)")
     ap.add_argument("--min-snr", type=float, default=5.0, help="minimum even-part SNR of a speckle (with --fit-center)")
+    ap.add_argument("--psf", help="unsaturated PSF (psf_flux.py --out): its centroid starts the axis fit, for a "
+                    "saturated core")
+    ap.add_argument("--linear-max", type=float, default=37000, help="skip speckles on ref pixels above this")
+    ap.add_argument("--hermitian", action="store_true",
+                    help="fill speckles hidden by a knife edge with C(-n) = conj C(n) (a nearly real pupil): the "
+                         "pupil amplitude and registration are kept, the odd part of the phase is lost")
     args = ap.parse_args()
 
     modes = xf.load_modes(args.modes)
@@ -54,7 +60,15 @@ def main():
         raise ValueError("modes are not cos/sin pairs of pure sinusoids")
 
     d = xf.load_set(args.data, modes, args.sci)
-    M, gres, ngood = xf.geometry(d, n, fit_center=args.fit_center)
+    if args.psf:
+        psf = fits.getdata(args.psf).astype(np.float64)
+        py, px = np.unravel_index(np.argmax(psf), psf.shape)
+        win = np.clip(psf[py - 3:py + 4, px - 3:px + 4], 0, None)
+        wy, wx = np.mgrid[-3:4, -3:4]
+        d["c"] = np.array([px + (win * wx).sum() / win.sum(), py + (win * wy).sum() / win.sum()])
+    core = max(8.0, float(d["head"].get("SATRAD", 0)))
+    M, gres, ngood = xf.geometry(d, n, fit_center=args.fit_center, core=core)
+    nu = int(d["head"].get("UNSATLST", -1)) + 1  # pokes below nu are unsaturated (PSF filter)
     resp, even, mref, amp, c, sig, esig = (d[k] for k in ("resp", "even", "mref", "amp", "c", "sig", "esig"))
     ny, nx = mref.shape
 
@@ -70,6 +84,8 @@ def main():
                    + even[k2, y0 - 2:y0 + 3, x0 - 2:x0 + 3] / amp[k2] ** 2)
             dy, dx = np.unravel_index(np.argmax(sub), sub.shape)
             y, x = y0 - 2 + dy, x0 - 2 + dx
+            if max(k1, k2) >= nu and mref[y - 2:y + 3, x - 2:x + 3].max() > args.linear_max:
+                continue  # saturated core or bleed
             Z = xf.solve_Z(resp[k1, y, x] / amp[k1], resp[k2, y, x] / amp[k2], th[k1], th[k2], s)
             e = 0.5 * (even[k1, y, x] / amp[k1] ** 2 + even[k2, y, x] / amp[k2] ** 2)
             esn = e / (0.5 * np.hypot(esig[k1] / amp[k1] ** 2, esig[k2] / amp[k2] ** 2))
@@ -96,6 +112,13 @@ def main():
 
     keys = {(int(a), int(b)) for a, b in pts[:, :2]}
     both = np.mean([(-a, -b) in keys for a, b in keys])
+    if args.hermitian:
+        add = [[-p[0], -p[1]] + [np.nan] * 3 + [p[5], -p[6]] + [np.nan] * 4 for p in pts
+               if (-int(p[0]), -int(p[1])) not in keys]
+        if add:
+            pts = np.vstack([pts, np.array(add)])
+        print(f"--hermitian: filled {len(add)} hidden speckles with conj C(n)")
+        both = 1.0
     if both < 0.9:
         print(f"only {100 * both:.0f}% of the speckles have their twin visible: no pupil field")
         hdr = fits.Header()

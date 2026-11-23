@@ -254,7 +254,7 @@ The pinned term per frame is $2\,\mathrm{Re}(C^*\mathbf G\bar z)$, from the odd-
 ### 9.9 Using calibrated WFS frames (2026-11-19)
 Suggestion: use the normalized, reference-subtracted WFS frames instead of raw camwfs. Findings, from cacao `acquireWFSim.c` (milk-xwcl `1286da59`) and `/opt/MagAOX/config`:
 
-- **The tweeter loop is `aol1`.** acquWFS writes `aol1_imWFS0` (dark-subtracted), `aol1_imWFS1` (normalized by total flux over `aol1_wfsmask`, **and multiplied by the mask**), and `aol1_imWFS2` (= imWFS1 − `aol1_wfsrefc`). With `compWFSpub` on, it also copies imWFS2 to **`aol1_imWFS2pub`**, which exists for readers outside the loop: readers of imWFS2 itself take its cache lines from the loop (MagAOX AGENTS rule 28, `shmim-monitor-speedups.md`). imWFS2pub carries the camera `atime`.
+- **The tweeter loop is `aol1`.** acquWFS writes `aol1_imWFS0` (dark-subtracted), `aol1_imWFS1` (normalized by total flux over `aol1_wfsmask`; *not* multiplied by the mask, as found in §9.17: try7's imWFS1 sums to 0.995 inside the mask and 0.075 outside), and `aol1_imWFS2` (= imWFS1 − `aol1_wfsrefc`). With `compWFSpub` on, it also copies imWFS2 to **`aol1_imWFS2pub`**, which exists for readers outside the loop: readers of imWFS2 itself take its cache lines from the loop (MagAOX AGENTS rule 28, `shmim-monitor-speedups.md`). imWFS2pub carries the camera `atime`.
 - **No code change is needed:** set `wfs.shmim=aol1_imWFS2pub`. It is float, the camwfs frame size, and updates once per camwfs frame, so the gate logic is unchanged. Preflight catches a stale stream, e.g. acquWFS not running or pub off.
 - **Benefits:**
   - Source-flux fluctuations are removed from the WFS signal.
@@ -515,3 +515,93 @@ The try3 log holds three runs with the same prefix; the files are from the last 
 
   Beyond 45 px the runs agree. Inside 45 px they differ by about ±0.15, which is within the IQR.
 - **Contrast scale:** the unocculted PSF peak at open is 20.4k (try6 ND3) / 0.0114 = 1.79M counts in 36 ms. The coronagraphic residual is then 3.2 × 10⁻⁵ of the peak per pixel at 45–65 px, and 1.2 × 10⁻⁵ at 90–130 px.
+
+### 9.17 Predicting turbulent camsci1 frames from the WFS (2026-11-22)
+**Data.** Two bundles, `try7/bundle_*`, record camsci1, camwfs and aol1_modevalWFS during simulated turbulence: a 5.000 s sequence (10,000 WFS frames) played in a loop, with the loop apparently closed (residual 0.046 µm rms in modevalWFS). Conditions match try7, except that the coronagraph was perturbed and realigned in all three planes. imWFS2 was not saved. camsci1 runs at 116.96 ms per frame (57–58 frames per bundle), camwfs and modevalWFS at 2 kHz. The bundles are 20 s (4 periods) apart, and modevalWFS repeats at 0.989 correlation.
+
+**Repeatability ceiling.** camsci1 frames at the same turbulence phase (32 pairs within 4 ms) have fluctuations about the mean that correlate at 0.99 (10–45 px), 0.98 (45–65), 0.90 (65–90) and 0.35 (90–130, noise-dominated). Random pairs give 0.
+
+**imWFS2 from camwfs.** imWFS2 = (raw − dark)/Σ_mask(raw − dark) − wfsref, over all pixels.
+- **Dark:** with the loaded `camwfs_dark.fits` (median 410.5), the reconstruction below reproduces the loop's own modevalWFS with slope 1.000 and correlation 0.999 (control modes < 300), 0.988 (300–600), 0.95 (600–1000) and 0.84 (1000–1563). Fitting a scalar dark to slope 1 had given 411.6.
+
+**Fourier coefficients.** c_t = (R Rᵀ + λ)⁻¹ R y_t, with R try7's measured imWFS2 response (2400 × 14400; condition number 173, so the pixels see all 2400 Fourier modes; modevalWFS has rank ≈ 1500) and λ = 10⁻³ of the mean eigenvalue.
+- **Noise:** the repeat separates signal from noise. Per frame, the signal is 0.087 µm rms over the 2400 modes and the noise 0.080 µm rms, both rising with |n|.
+
+**Per-mode (diagonal) model fails.** I = ref + Σ O_k⟨c_k⟩ + Σ E_k⟨c_k²⟩ with try7's odd and even cubes reaches only 0.36 correlation (20–65 px). The phase variance is about 0.4 rad², and neighbouring frequencies' speckles overlap by λ/D, so the cross terms Σ_{k≠l} c_k c_l Re(S_k* S_l) are as large as the self terms.
+
+**Physical model** (`try7/turb_analysis/prop.py`):
+- **Inputs:** c_t (2 ms means, sequence mean removed) → phase G(n) c_t on a 3× oversampled DM grid. G(n) is the try6 fit, scaled by 0.91/λ.
+- **Propagation:** ideal coronagraph L(e^{iφ} − ⟨e^{iφ}⟩_L), with L the try4 Lyot pupil (annulus and spiders) → 768² FFT → |E|² averaged over each camsci1 exposure → camsci1 pixels via the measured M (try4), axis and twin sign −1.
+- **Bandwidth:** 3 wavelengths (0.86, 0.91, 0.96 µm).
+
+**Results** (correlation of predicted and measured frame-to-frame fluctuations; b2 was never used for fitting):
+
+| model | 10–20 | 20–30 | 30–45 | 45–65 | 65–90 | 90–130 |
+|---|---|---|---|---|---|---|
+| per-mode cubes (b1) | — | 0.36 (20–65) | | | | |
+| physical, 0.91 µm only (b1) | 0.54 | 0.70 | 0.71 | 0.67 | 0.44 | 0.09 |
+| physical, twin sign +1 (b1) | 0.44 | 0.44 | 0.45 | 0.41 | 0.23 | 0.04 |
+| physical, 3 λ, try7 geometry (b2) | 0.55 | 0.72 | 0.73 | 0.72 | 0.51 | 0.11 |
+| + axis (−0.5, −0.5) px, scale +1.5%, fit on b1 (b2) | 0.57 | 0.77 | 0.79 | 0.77 | 0.55 | 0.12 |
+| 3 λ + static field C per pixel, fit on b1 (b2, try7 geometry) | 0.58 | 0.79 | 0.78 | 0.75 | 0.57 | 0.17 |
+| ceiling (same-phase repeat) | 0.99 | 0.99 | 0.99 | 0.98 | 0.90 | 0.35 |
+
+- **Lag:** the best lag is 30–40 ms from the camsci1 timestamp to the end of the exposure window (readout).
+- **Twin sign:** turbulence independently confirms side sign −1 (§9.12).
+- **WFS noise is not the limit:** averaging the two bundles' coefficients at matched phase (half the noise power) leaves the correlations unchanged. A Wiener weighting per mode lowers them slightly.
+- **The static field:** C interferes with the turbulent speckles. Fitting one complex C per pixel on b1 (2 parameters, 55 frames) adds 0.03–0.07 on b2. The fitted |C|² is small, 34 counts at 45–65 px. C changed with the realignment, so try7's C cannot be used directly.
+- **Absolute mean halo, no fit:** the model halo with the a-priori scale (try6/try7 PSF chain: 1.79M × 117/36 = 5.8M counts per unocculted peak), plus try7's static ref × 3.25, matches the measured mean (minus try7's dark) to 1.00–1.09 at 20–90 px. It is 1.45 at 10–20 px, where the knife edge breaks the ideal-coronagraph assumption, and 1.29 at 90–130 px (static, realigned). The fluctuation regression slope, 4.3M, is lower than 5.8M because of regression dilution (slope = corr × σ_M/σ_P), not optical gain.
+
+**Remaining error** (0.77 against 0.98) repeats between bundles, so it is model error. Candidates:
+- the realigned pupil and Lyot stop (try4 registration);
+- reconstruction errors that repeat (aliasing, the pyramid's response at 0.4 rad² against the small-signal calibration);
+- the knife edge near the core;
+- bandwidth sampling (3 λ);
+- the static field.
+
+These are fit-testable on b1 against b2.
+
+**Pupil registration (user: try7 differs from try4, so fit the pupil on try6/try7).**
+- **Tool:** `quadrature_field.py` now takes `--psf` and `--linear-max` (saturated core, as in `dm_response.py`) and `--hermitian` (knife edge: fill C(−n) = C(n)*).
+- **try6:** gives a clean pupil (`try6/try6_field.fits`). The try6 phase map is noisy (0.70 rad rms, against 0.33 for try4), because the ND3 segment's speckle SNR is 6–7 at 20–45 px.
+- **try7:** the hermitian fill is noisy, because a small axis error breaks the symmetry.
+- **Shifts between data sets**, by three methods that agree:
+  - correlation of the |E| maps: try6 = try4 + (0.55, 0.20) act;
+  - frequency-space cross-power, |Σ C_a C_b* e^{2πi n·s/50}| over the speckles both sets see: try6 = try4 + (0.56, 0.04), with coherence 0.79 → 0.87. try7 = try6 within 0.15 act (coherence 0.77 unshifted, so the static fields of try6 and try7 are also largely the same);
+  - parametric Lyot fit (annulus plus 4 spiders; `try7/turb_analysis/lyot.py`): try3 (24.16, 24.62), try4 (24.17, 24.68), try6 (24.77, 24.83), try7 (24.69, 24.89, center only). Outer radius 20.6–20.8 act, inner 9.7–9.8, spiders at 66°, 0.7 act wide.
+- **The turbulence prefers the try4 position.** Correlations at 20–65 px, b1:
+
+  | pupil in the model | 20–30 | 30–45 | 45–65 | 65–90 |
+  |---|---|---|---|---|
+  | try4 map, as is | 0.757 | 0.786 | 0.760 | 0.539 |
+  | try4 map at try6's position (+0.6, +0.15) | 0.746 | 0.761 | 0.730 | 0.504 |
+  | try4 map, best shift (−0.2, +0.3) | 0.760 | 0.794 | 0.769 | 0.555 |
+  | parametric try4 / try6 | 0.715 / 0.700 | 0.748 / 0.725 | 0.707 / 0.692 | 0.478 / 0.457 |
+  | try6 map (noisy) | 0.725 | 0.733 | 0.701 | 0.440 |
+
+  b2 confirms it (try6 position worse by 0.01–0.03). The realignment after try7 may have moved the Lyot stop back toward its try4 registration. Either way, ±0.6 act changes the correlation by only 0.02–0.04, so the registration is not what limits the prediction.
+- **Pupil shape:** the parametric pupils lose 0.04–0.05 against the try4 map. The real pupil has structure the 7-parameter model misses.
+
+**Other tests** (b1, 20–65 px unless noted):
+- **Exposure time:** 117 ms (the frame period) with a 40 ms lag is best; 100 and 130 ms are slightly worse.
+- **Measured pupil amplitude** instead of a binary pupil: ±0.02, by zone.
+- **Bandwidth:** 5 wavelengths over 0.83–0.99 or 0.87–0.95 µm instead of 3: within ±0.02.
+- **Measured static pupil phase** as an aberration: try6's lowers the correlation to about 0.55 (noise); try4's to 0.72. Neither describes the static field at turbulence time.
+- **Static field C fitted per pixel on b1,** with the refit geometry: on b2 it helps at 10–20 px (0.57 → 0.63) and 90–130 px (0.12 → 0.18), but costs 0.03–0.06 at 30–65 px. Two complex parameters per pixel from 55 frames is fragile.
+
+**Best held-out result** (b2; try4 map shifted (−0.2, +0.3) act, axis and scale refit on b1, 3 λ, intensity only): 0.57 (10–20), 0.77 (20–30), 0.80 (30–45), 0.78 (45–65), 0.56 (65–90), 0.12 (90–130), against the 0.98–0.99 ceiling. The remaining error is insensitive to the pupil, bandwidth, timing and WFS noise. The leading candidates are deterministic WFS reconstruction errors (aliasing; the pyramid's response at turbulence amplitudes, against the small-signal calibration) and the knife-edge coronagraph's departure from an ideal one.
+
+### 9.18 Plan: cross-term calibration with phase screens (2026-11-23)
+**Motivation (user).** The suspected cause of the remaining error is cross terms, Σ_{k≠l} c_k c_l Re(S_k* S_l). Single-mode speckle calibrations can't measure them. The turbulence data can't separate WFS reconstruction error from optical-model error, because the true phase is unknown.
+
+**Design.**
+- **Generator:** `tools/make_screens.py` makes random screens Σ c_k m_k from the 2400 Fourier modes, with c_k ~ N(0, var(|n|)). var(|n|) is the turbulence residual's per-mode signal variance from the bundles (§9.17), as a median per 1-cycle bin, saved as `try7/turb_analysis/turb_sigvar.npy`.
+- **Amplitude:** 0.087 µm rms commanded and about 0.4 rad² of phase, the regime of the turbulence data.
+- **Cube:** `example/screens_turb_1700.fits` (seed 1): 1200 screens at full amplitude, 400 at half, and the first 100 repeated (noise ceiling, drift). The COEFFS and SCALE extensions record the true c.
+- **Configs (one session, same alignment):** `example/runC.conf` (single-mode speckles, try8, about 13 min), then `example/runD.conf` (screens, try9, about 9 min), both in try7 conditions (knife mask in, open, 36 ms) with PSF blocks; loop open, turbulence off. Then a turbulence capture that saves imWFS2, the camwfs dark and a camsci1 dark at the capture exposure.
+- **Brightness:** the model gives speckle peaks up to about 36k counts near the core, against the 37k linearity limit.
+
+**Analysis.**
+1. **Optical model with the true phase:** propagate the commanded c; compare the even part (all cross terms) and the odd part (needs C) by zone, against the repeat ceiling.
+2. **WFS:** reconstruct ĉ from each screen's imWFS2 odd part with try7's single-mode R; check gain per |n|, crosstalk and superposition at turbulence amplitude, and the WFS even part (nonlinearity). Compare the full and half-amplitude groups.
+3. **Calibrate the side that fails:** a WFS correction ĉ → c (regularized, local in n), or empirical local cross terms for camsci1. Then repeat the turbulence prediction of §9.17.
