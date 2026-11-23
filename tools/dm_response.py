@@ -15,6 +15,12 @@ its fitted kappa is G(n)^2 / G(2n).
 Prints G binned by |n| and a fit of kappa0 exp(-(f/f0)^p), where f = |n| / grid is in cycles per
 actuator. Writes a FITS table with one row per mode: n_x, n_y, |n|, a, E, G, and g = G/kappa.
 Not for focal-plane-mask data: it needs both speckles and an unblocked PSF.
+
+A run with a saturated core (sci.satRadius) needs --psf, the unsaturated PSF in calibration-filter counts
+from `psf_flux.py --out`, for the normalization, and --fit-center, because the ref maximum is not the
+axis. Apertures that touch reference pixels above --linear-max (the core and its bleed) are skipped.
+With an unsaturated segment (UNSATLST), g is also printed for each segment, which checks the
+transmission T where the segments share |n|.
 """
 
 import argparse
@@ -55,19 +61,38 @@ def main():
     ap.add_argument("--radius", type=float, default=5.0, help="aperture radius [px]")
     ap.add_argument("--dl", type=float, default=0.08, help="radial half-elongation of the speckle aperture")
     ap.add_argument("--kappa", type=float, default=4 * np.pi / 0.91, help="4 pi / lambda [rad/um]")
+    ap.add_argument("--psf", help="unsaturated PSF in calibration-filter counts (psf_flux.py --out) for the "
+                    "normalization; needed when the refs are saturated")
+    ap.add_argument("--fit-center", action="store_true", help="fit the optical axis (saturated core)")
+    ap.add_argument("--linear-max", type=float, default=37000, help="skip apertures on ref pixels above this")
     ap.add_argument("--out", help="output FITS table")
     args = ap.parse_args()
 
     modes = xf.load_modes(args.modes)
     n, R, th, res, pairs = xf.mode_table(modes, args.grid)
     d = xf.load_set(args.data, modes, args.sci)
-    M, gres, ngood = xf.geometry(d, n)
-    c, yy, xx, even, amp = d["c"], d["yy"], d["xx"], d["even"], d["amp"]
+    yy, xx = d["yy"], d["xx"]
+    w = args.radius
+    if args.psf:  # its centroid starts the axis fit (the core mask center is biased by the bleed)
+        psf = fits.getdata(args.psf).astype(np.float64)
+        py, px = np.unravel_index(np.argmax(psf), psf.shape)
+        win = np.clip(psf[py - 3:py + 4, px - 3:px + 4], 0, None)
+        wy, wx = np.mgrid[-3:4, -3:4]
+        pc = np.array([px + (win * wx).sum() / win.sum(), py + (win * wy).sum() / win.sum()])
+        F = psf[np.hypot(xx - pc[0], yy - pc[1]) < w].sum()
+        d["c"] = pc
+    core = max(8.0, float(d["head"].get("SATRAD", 0)))
+    M, gres, ngood = xf.geometry(d, n, fit_center=args.fit_center, core=core)
+    c, even, amp = d["c"], d["even"], d["amp"]
     ny, nx = d["mref"].shape
     fr = np.hypot(*n.T)
-    w = args.radius
+    nonlin = d["mref"] > args.linear_max
+    nu = int(d["head"].get("UNSATLST", -1)) + 1
 
-    F = d["mref"][np.hypot(xx - c[0], yy - c[1]) < w].sum()
+    if not args.psf:
+        if nu > 0 or nonlin[np.hypot(xx - c[0], yy - c[1]) < w].any():
+            raise SystemExit("the ref core is saturated: give the unsaturated PSF with --psf")
+        F = d["mref"][np.hypot(xx - c[0], yy - c[1]) < w].sum()
     E = np.full(len(n), np.nan)
     for k in range(len(n)):
         q = M @ n[k]
@@ -80,20 +105,30 @@ def main():
                 tot = np.nan
                 break
             m = capsule(xx, yy, c, s * q, w, args.dl)
+            if k >= nu and nonlin[m].any():  # the unsaturated segment is linear
+                tot = np.nan
+                break
             ann = capsule(xx, yy, c, s * q, w + 5, args.dl + 0.04) & ~capsule(xx, yy, c, s * q, w + 2, args.dl + 0.02)
             e = np.asarray(even[k], dtype=np.float64)
             tot += e[m].sum() - np.median(e[ann]) * m.sum()
         E[k] = tot / F
     G = np.array([solve_G(E[k], amp[k]) for k in range(len(n))])
 
-    print(f"{args.data}: geometry from {ngood} speckles (residual {gres:.2f} px), PSF flux in r < {w:g} px {F:.0f}")
-    print(" |n|     N   a [um]   G [rad/um]   g = G/kappa")
+    print(f"{args.data}: geometry from {ngood} speckles (residual {gres:.2f} px), axis ({c[0]:.1f}, {c[1]:.1f}), "
+          f"PSF flux in r < {w:g} px {F:.0f}" + (f", T = {d['trans']:.5f} for pokes < {nu}" if nu > 0 else ""))
+    print(" |n|     N   a [um]   G [rad/um]   g = G/kappa" + ("   g unsat (N)   g sat (N)" if nu > 0 else ""))
     for lo, hi in [(2, 3), (3, 4), (4, 5), (5, 6), (6, 8), (8, 10), (10, 12), (12, 14), (14, 16), (16, 18), (18, 20),
                    (20, 22), (22, 25)]:
         m = (fr >= lo) & (fr < hi) & np.isfinite(G)
         if m.sum() < 3:
             continue
-        print(f" {lo:2d}-{hi:<3d} {m.sum():4d}   {np.median(amp[m]):.4f}   {np.median(G[m]):7.2f}      {np.median(G[m]) / args.kappa:.3f}")
+        line = (f" {lo:2d}-{hi:<3d} {m.sum():4d}   {np.median(amp[m]):.4f}   {np.median(G[m]):7.2f}      "
+                f"{np.median(G[m]) / args.kappa:.3f}")
+        if nu > 0:
+            for seg in (np.arange(len(n)) < nu, np.arange(len(n)) >= nu):
+                ms = m & seg
+                line += f"   {np.median(G[ms]) / args.kappa:.3f} ({ms.sum():3d})" if ms.sum() >= 3 else "              "
+        print(line)
 
     ok = np.isfinite(G)
     f = fr / args.grid

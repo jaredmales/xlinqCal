@@ -123,7 +123,7 @@ def load_set(prefix, modes, sci="camsci1", trans=None):
                 esig=esig, yy=yy, xx=xx, head=h, trans=T)
 
 
-def geometry(d, n, nmin=4, nmax=20, search=4, clip=2.5, fit_center=False, M0=None):
+def geometry(d, n, nmin=4, nmax=20, search=4, clip=2.5, fit_center=False, M0=None, core=8):
     """Fit the speckle geometry M (px per cycle) from the even cube, normalized to a positive trace.
 
     A first fit uses each mode's brightest off-core pixel (sp.fit_geometry), with the SNR cut lowered
@@ -135,12 +135,13 @@ def geometry(d, n, nmin=4, nmax=20, search=4, clip=2.5, fit_center=False, M0=Non
     fit_center: also fit the optical-axis position and update d["c"] (needed with a focal-plane mask,
     where the ref maximum is not the axis). Each mode then contributes only its brighter speckle, so
     it also works when a knife edge blocks one of the pair. M0: the starting M, e.g. from a data set
-    without the mask; otherwise it comes from the brightest off-core pixels.
+    without the mask; otherwise it comes from the brightest off-core pixels. core: the radius [px] about
+    d["c"] excluded from that first fit (the saturated core and its bleed, e.g. sci.satRadius).
     """
     from scipy.ndimage import uniform_filter
 
     even, c = d["even"], d["c"]
-    pk = sp.even_peaks(even, c[0], c[1], core=8)
+    pk = sp.even_peaks(even, c[0], c[1], core=core)
     snr = pk[:, 2] / pk[:, 3]
     smin = 20 if (snr > 20).sum() >= 100 else max(5.0, np.percentile(snr, 70))
     if M0 is None:

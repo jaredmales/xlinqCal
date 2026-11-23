@@ -465,3 +465,53 @@ The try3 log holds three runs with the same prefix; the files are from the last 
 - The prediction pipeline (§9.13) must scale each Fourier coefficient by g(n). Commanded µm overstate the high-order surface by up to 4× near the DM Nyquist frequency. In the measured-response approach (regularized inverse of R_mv, then phase), the camsci1 side must use G(n), not κ.
 - Probe amplitudes for a target speckle contrast scale as 1/g(n); `shape_pokes.py`'s empirical energy law already includes this.
 - The per-mode table is in `try2/try2_dmresp.fits` (also try1, try3).
+
+### 9.16 try6–try7: ND1 with an unsaturated low-order segment, and the knife edge with PSF blocks (2026-11-22)
+**Data sets.** Both use `example/runA.conf` and `runB.conf`: LyotLg1, `modFourier_48_shaped.fits`, `poke.amp=1`, camsci1 at 36 ms, EM gain 1, nSettle 0, nFrames 1. PSF blocks (6 × 50 frames, speckles at sep 14, angle 75) were taken at the start and the end.
+
+| set | FPM | calibration filter | PSF filter | unsatLast | speckAmp | time |
+|---|---|---|---|---|---|---|
+| try6 | knifemask, offset | ND1_0 | ND3_0 | 287 | 0.009 | 13 min |
+| try7 | knifemask, in | open | ND3_0 | — | 0.025 | 13 min |
+
+**Transmissions** (`psf_flux.py`, start / end block):
+- **ND3_0/ND1_0:** 0.0684 ± 0.0047 / 0.0695 ± 0.0007. The mean, 0.0690, is 2.90 mag, not the nominal 5. ND1 is 0.165 of open.
+- **ND3_0/open:** 0.0113 / 0.0115 (2 speckles; the knife edge blocks the other 2), 4.86 mag.
+- **Scaling check:** try6's ND1 speckles, scaled to open (÷ 0.165) and to try7's amplitude ((0.025/0.009)²), predict 252k counts per aperture; try7 measured 255–270k.
+
+**Saturation at ND1.**
+- **Extent:** the ref core is saturated at 42k. The bleed stripe covers x 145–150, y 138–176, at most 25 px from the axis, and the maximum beyond 31 px is 3.2k.
+- **Core-mask center:** the mask was centered on the pixels above linearMax, which put it at (147.6, 160.3), 9 px from the axis (149.9, 151.2, the ND3 PSF centroid). It still covered the core and the stripe. The mask affects only the linearity check, so no data were lost.
+- **try7:** 4 acquisitions exceeded 37k. Pokes 6, 18 and 19 (+ sign) reached 37.5k, 40.4k and 37.6k, as in try5 (poke 16). Reference 1157 reached 50.7k, against about 20k for its neighbors: a single-frame transient (nFrames = 1).
+
+**Analysis tools.**
+- **`dm_response.py`:** for saturated refs, `--psf` takes the unsaturated PSF in calibration-filter counts (`psf_flux.py --out`) for the normalization, and its centroid starts `--fit-center`. Apertures on ref pixels above `--linear-max` are skipped, in the saturated segment only. With UNSATLST, g is printed for each segment.
+- **`xlq_fourier.geometry`:** takes `core=`, the radius excluded from the first fit (SATRAD); otherwise the first fit locks onto the edge of the saturated core.
+- **Regression:** try2 is unchanged.
+
+**try6: g(n) across the switch.**
+
+| \|n\| | 3–4 | 4–5 | 5–6 | 6–8 | 8–10 | 10–12 | 12–14 | 14–16 | 16–18 | 18–20 | 20–22 | 22–25 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| g, try6 | 0.923 | 0.928 | 0.889 | 0.848 | 0.777 | 0.694 | 0.603 | 0.515 | 0.433 | 0.362 | 0.299 | 0.235 |
+| g, try3 | 0.911 | 0.925 | 0.901 | 0.851 | 0.786 | 0.699 | 0.607 | 0.514 | 0.433 | 0.359 | 0.298 | 0.235 |
+| try6 / try2 | 0.93 | 0.94 | 0.94 | 0.94 | 0.95 | 0.94 | 0.95 | 0.95 | 0.95 | 0.96 | 0.95 | 0.96 |
+
+- **Geometry:** 1196 speckles, residual 0.69 px, axis (149.0, 151.1). The fit gives κ₀ = 15.03, f₀ = 0.356, p = 1.53, with a 2.5% rms fractional residual.
+- **The switch is seamless.** The segments share |n| = 9–11.3. Relative to the fit, the ND3 modes give 1.019 (40 modes) and the ND1 modes 1.022 (116 modes). T cancels in the ND3 segment, which is normalized by the ND3 PSF, and enters only the ND1 segment. So this checks T to better than 1%.
+- **The Lyot-stop offset is a scale.** try6 matches try3 (Lyot, unsaturated at ND3) within 1% at every |n|. Both are 4–7% below try2 (no Lyot stop) at all |n|, not only at low order as §9.15 suggested. This is consistent with the stop changing the speckle-to-PSF shape ratio of the normalization, not the DM response.
+- **Noise:** the per-mode scatter of G about the fit is 1.1–1.7% for |n| > 8 (ND1, 1 frame), against 2.1–4.0% for try3 (ND3, 2 frames). The ND3 segment's scatter is 3.0%, against 2.5% for try3, as expected for 1 frame against 2.
+- **Product:** the per-mode table is in `try6/try6_dmresp.fits`, and the unsaturated PSF in ND1 counts in `try6/try6_psf_nd1.fits`.
+
+**try7: knife edge, repeating try5.**
+- **Geometry:** axis (148.6, 152.1), residual 0.63 px.
+- **2f test:** κ is 16.9 ± 1.7, 18.7 ± 1.0, 21.3 ± 0.9 and 25.9 ± 1.3 for |n| = 4–6, 6–8, 8–12 and 12–18. try5 gave 15.7, 18.3, 22.0 and 26.6. try6's fit predicts G(n)²/G(2n) = 17.1, 18.6 and 21.7 at |n| = 5, 7 and 10. The sides agree (18.1, 19.1), and there is no DM 2f harmonic.
+- **Coherent fraction R:**
+
+| radius [px] | 0–12 | 12–20 | 20–30 | 30–45 | 45–65 | 65–90 | 90–130 |
+|---|---|---|---|---|---|---|---|
+| R, try7 | 0.52 | 0.65 | 0.54 | 0.56 | 0.47 | 0.36 | 0.30 |
+| R, try5 | 0.71 | 0.58 | 0.43 | 0.47 | 0.47 | 0.35 | 0.30 |
+
+  Beyond 45 px the runs agree. Inside 45 px they differ by about ±0.15, which is within the IQR.
+- **Contrast scale:** the unocculted PSF peak at open is 20.4k (try6 ND3) / 0.0114 = 1.79M counts in 36 ms. The coronagraphic residual is then 3.2 × 10⁻⁵ of the peak per pixel at 45–65 px, and 1.2 × 10⁻⁵ at 90–130 px.
