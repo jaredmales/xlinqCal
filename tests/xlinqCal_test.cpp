@@ -1076,6 +1076,122 @@ TEST_CASE( "xlinqCal takes a WFS camera dark with the sci dark", "[xlinqCal][int
     std::filesystem::remove_all( dir );
 }
 
+/// With EM gain > 1 and an unsaturated static frame, a PSF block whose calibration speckles saturate at the open filter
+/// (2026-11-25, EM gain 30), or a poke that saturates, stops the run with the DM restored and the wheel put back.
+TEST_CASE( "xlinqCal stops when frames saturate with EM gain above 1", "[xlinqCal][integration][indi]" )
+{
+    using namespace xlinqCal;
+
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / ( xlinqCalTest::testPrefix() + "emsat_out" );
+    std::filesystem::create_directories( dir );
+    xlinqCalTest::fakeIndi indi( dir / "indi" );
+
+    const std::string dev   = "xlsimcam";
+    const std::string wheel = "xlsimfw";
+    indi.set( dev + ".fsm.state", "READY" );
+    indi.set( dev + ".exptime.current", "0.05" );
+    indi.set( dev + ".emgain.current", "30" );
+    indi.set( wheel + ".fsm.state", "READY" );
+    indi.set( wheel + ".filterName.open", "On" );
+    indi.set( wheel + ".filterName.ND3_0", "Off" );
+    indi.oneOfMany( wheel + ".filterName" );
+
+    xlinqSimConfig cfg;
+    cfg.prefix       = xlinqCalTest::testPrefix() + "emsat_";
+    cfg.dmChannel    = cfg.prefix + "dm01disp04";
+    cfg.dmComb       = cfg.prefix + "dm01disp";
+    cfg.wfsName      = cfg.prefix + "camwfs";
+    cfg.sciName      = cfg.prefix + "camsci1";
+    cfg.wfsFps       = 1000;
+    cfg.sciFps       = 20;
+    cfg.sciPostDelay = 0.015;
+    cfg.attenFile    = ( indi.state / ( wheel + ".filterName.ND3_0" ) ).string();
+    cfg.attenFactor  = 0.001;
+    cfg.sciQuadGain  = 2000; // speckles far above 37000 at open, below it at ND3_0
+
+    mx::improc::eigenCube<float> pokes    = xlinqSim::randomPokes( cfg.dmRows, cfg.dmCols, 3, 3 );
+    std::string                  pokeFile = ( dir / "pokes.fits" ).string();
+    mx::fits::fitsFile<float>    ff;
+    REQUIRE( ff.write( pokeFile, pokes ) == mx::error_t::noerror );
+
+    xlinqSim sim( cfg );
+    sim.start();
+
+    auto runApp = [&]( const std::string &prefix, std::vector<std::string> extra )
+    {
+        std::vector<std::string> args = { "xlinqCal",
+                                          "--dm.channel=" + cfg.dmChannel,
+                                          "--dm.comb=" + cfg.dmComb,
+                                          "--sci.shmim=" + cfg.sciName,
+                                          "--wfs.shmim=" + cfg.wfsName,
+                                          "--poke.file=" + pokeFile,
+                                          "--sci.nFrames=2",
+                                          "--preflight.time=0.3",
+                                          "--out.dir=" + dir.string(),
+                                          "--out.prefix=" + prefix,
+                                          "--out.timestamp=false",
+                                          "--indi.enable=true",
+                                          "--indi.get=" + indi.getCmd,
+                                          "--indi.set=" + indi.setCmd,
+                                          "--indi.poll=0.2",
+                                          "--sci.device=" + dev,
+                                          "--sci.linearMax=37000",
+                                          "--yes" };
+        args.insert( args.end(), extra.begin(), extra.end() );
+
+        std::vector<char *> argv;
+        for( std::string &a : args )
+        {
+            argv.push_back( a.data() );
+        }
+
+        xlinqCal::xlinqCal app;
+        int                rv = app.main( argv.size(), argv.data() );
+        return std::make_pair( rv, app.nDone() );
+    };
+
+    mx::improc::milkImage<float> dm( cfg.dmChannel );
+
+    SECTION( "calibration speckles saturating at the open filter stop the run" )
+    {
+        auto [rv, nDone] = runApp( "speck",
+                                   { "--poke.amp=0.001",
+                                     "--psf.n=3",
+                                     "--psf.wheel=" + wheel,
+                                     "--psf.filter=ND3_0",
+                                     "--psf.discard=1",
+                                     "--psf.speckAmp=0.5",
+                                     "--psf.speckSep=10" } );
+        REQUIRE( rv == -1 );
+        REQUIRE( nDone == 0 );
+        REQUIRE( dm().abs().maxCoeff() == 0 );
+
+        // The wheel is back at (or never left) open
+        REQUIRE( indi.get( wheel + ".filterName.open" ) == "On" );
+        REQUIRE( indi.get( wheel + ".filterName.ND3_0" ) == "Off" );
+    }
+
+    SECTION( "a saturating poke stops the run" )
+    {
+        auto [rv, nDone] = runApp( "poke", { "--poke.amp=0.5" } );
+        REQUIRE( rv == -1 );
+        REQUIRE( nDone == 0 );
+        REQUIRE( dm().abs().maxCoeff() == 0 );
+    }
+
+    SECTION( "the same pokes run with EM gain 1" )
+    {
+        indi.set( dev + ".emgain.current", "1" );
+        auto [rv, nDone] = runApp( "gain1", { "--poke.amp=0.5" } );
+        REQUIRE( rv == 0 );
+        REQUIRE( nDone == 3 );
+    }
+
+    dm.close();
+    sim.stop();
+    std::filesystem::remove_all( dir );
+}
+
 /// With a saturated core, xlinqCal takes unsaturated PSFs with the ND wheel at the start and end, with +/- calibration
 /// speckles at both filters whose ratio is the transmission, puts the wheel back each time, and excludes the core
 /// from the linearity check. The PSF centers the core mask, which the bleed stripe pulls off center. Already at the

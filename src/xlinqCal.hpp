@@ -531,6 +531,16 @@ class xlinqCal : public mx::app::application
      */
     int checkEndSnapshots();
 
+    /// True if a sci frame maximum is above sci.linearMax while the EM gain (from INDI) is above 1.
+    /** Saturating an EMCCD with EM gain > 1 ages its EM register, so this stops a run: in the preflight, in
+     * every PSF block frame, and in every poke and reference frame.
+     */
+    bool emSaturating( double maxv /**< [in] the frame maximum, core included */ ) const;
+
+    /// Log the EM-gain saturation error for a frame maximum, naming where it happened.
+    void logEmSaturating( double             maxv, /**< [in] the frame maximum */
+                          const std::string &where /**< [in] e.g. "the PSF block" */ );
+
     /// The INDI properties recorded at start and end: the camera's standard ones, then indi.props.
     std::vector<std::string> indiPropList() const;
 
@@ -1712,7 +1722,7 @@ inline int xlinqCal::preflight()
         m_sciPreMaxOut = maxOutsideCore( frame );
     }
 
-    if( m_sciLinearMax > 0 && m_sciPreMax > m_sciLinearMax && std::isfinite( m_sciEmgain ) && m_sciEmgain > 1 )
+    if( emSaturating( m_sciPreMax ) )
     {
         logError( m_sciName + " is above sci.linearMax with EM gain " + std::to_string( m_sciEmgain ) +
                   ": saturating with EM gain > 1 ages the EM register; set EM gain to 1" );
@@ -2304,6 +2314,20 @@ inline int xlinqCal::acquire( bool                                         settl
         }
 
         prev = cnt0;
+
+        if( emSaturating( frame.maxCoeff() ) )
+        {
+            logEmSaturating( frame.maxCoeff(), "an acquisition" );
+
+            wfsGateStats st;
+            for( size_t j = 0; j < m_wfs.size(); ++j )
+            {
+                m_wfs[j]->closeGate( wfsMeans[j], st );
+            }
+
+            return -1;
+        }
+
         sciSum += frame;
         sciMax = std::max( sciMax, maxOutsideCore( frame ) );
     }
@@ -2499,6 +2523,19 @@ inline void xlinqCal::restoreDm()
     m_dmWritten = false;
 
     log( "restored " + m_dmChannel );
+}
+
+inline bool xlinqCal::emSaturating( double maxv ) const
+{
+    return m_sciLinearMax > 0 && maxv > m_sciLinearMax && std::isfinite( m_sciEmgain ) && m_sciEmgain > 1;
+}
+
+inline void xlinqCal::logEmSaturating( double maxv, const std::string &where )
+{
+    logError( m_sciName + " reached " + std::to_string( maxv ) + " in " + where +
+              ", above sci.linearMax with EM gain " + std::to_string( m_sciEmgain ) +
+              ": saturating with EM gain > 1 ages the EM register. Stopping; set EM gain to 1, or lower "
+              "psf.speckAmp / poke.amp" );
 }
 
 inline std::vector<std::string> xlinqCal::indiPropList() const
@@ -3119,6 +3156,12 @@ inline int xlinqCal::psfAverage( const mx::improc::eigenImage<float> &cmd,
         if( ( rv = waitSciFrame( &frame, cnt0 ) ) != 0 )
         {
             return rv;
+        }
+
+        if( emSaturating( frame.maxCoeff() ) )
+        {
+            logEmSaturating( frame.maxCoeff(), "the PSF block" );
+            return -1;
         }
 
         mean += frame;
