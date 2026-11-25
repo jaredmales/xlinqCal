@@ -126,7 +126,7 @@ make            # xlinqCal and xlinqSim
 make test       # unit tests + simulator integration tests
 ```
 
-`xlinqSim` creates `xlsim_dm01disp04`, `xlsim_dm01disp`, `xlsim_camwfs`, and `xlsim_camsci1`, with known linear responses. It also writes `xlsim_wfsR.fits`, `xlsim_sciR.fits`, and `xlsim_pokes.fits`, so xlinqCal can be tried on a workstation:
+`xlinqSim` creates `xlsim_dm01disp04`, `xlsim_dm01disp`, `xlsim_camwfs`, and `xlsim_camsci1`, with known linear responses. It also writes `xlsim_wfsR.fits`, `xlsim_sciR.fits`, and `xlsim_pokes.fits`, so xlinqCal can be tried on a workstation. `--sim.flowfs=true` adds `xlsim_camflowfs`, a 3 kHz focal-plane camera (linear plus quadratic, like camflowfs) to list in `--wfs.shmim`:
 
 ```
 ./xlinqSim &

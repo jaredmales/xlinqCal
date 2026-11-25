@@ -412,6 +412,114 @@ TEST_CASE( "xlinqCal recovers simulated responses", "[xlinqCal][integration]" )
     std::filesystem::remove_all( dir );
 }
 
+/// A focal-plane WFS at its own rate (camflowfs: 3 kHz, the in-focus light rejected by the knife edge) alongside a
+/// 2 kHz camwfs: its odd part matches amp * R * shape, its even part amp^2 |H shape|^2, and each stream's gate holds
+/// its own rate's worth of frames.
+TEST_CASE( "xlinqCal recovers a focal-plane WFS at a different rate", "[xlinqCal][integration]" )
+{
+    using namespace xlinqCal;
+
+    xlinqSimConfig cfg;
+    cfg.prefix       = xlinqCalTest::testPrefix() + "flow_";
+    cfg.dmChannel    = cfg.prefix + "dm01disp04";
+    cfg.dmComb       = cfg.prefix + "dm01disp";
+    cfg.wfsName      = cfg.prefix + "camwfs";
+    cfg.sciName      = cfg.prefix + "camsci1";
+    cfg.flowName     = cfg.prefix + "camflowfs";
+    cfg.wfsFps       = 2000;
+    cfg.flowFps      = 3000;
+    cfg.sciFps       = 20;
+    cfg.sciPostDelay = 0.015;
+    cfg.flowGain     = 100;
+    cfg.flowQuadGain = 100;
+    cfg.flowNoise    = 1;
+    cfg.drift        = 0.01;
+
+    const int   nPoke   = 3;
+    const float amp     = 0.1;
+    const int   nFrames = 4;
+
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / ( cfg.prefix + "out" );
+    std::filesystem::create_directories( dir );
+
+    mx::improc::eigenCube<float> pokes    = xlinqSim::randomPokes( cfg.dmRows, cfg.dmCols, nPoke, 11 );
+    std::string                  pokeFile = ( dir / "pokes.fits" ).string();
+    mx::fits::fitsFile<float>    ff;
+    REQUIRE( ff.write( pokeFile, pokes ) == mx::error_t::noerror );
+
+    xlinqSim sim( cfg );
+    sim.start();
+
+    std::vector<std::string> args = { "xlinqCal",
+                                      "--dm.channel=" + cfg.dmChannel,
+                                      "--dm.comb=" + cfg.dmComb,
+                                      "--sci.shmim=" + cfg.sciName,
+                                      "--wfs.shmim=" + cfg.wfsName + "," + cfg.flowName,
+                                      "--poke.file=" + pokeFile,
+                                      "--poke.amp=" + std::to_string( amp ),
+                                      "--sci.nFrames=" + std::to_string( nFrames ),
+                                      "--preflight.time=0.5",
+                                      "--out.dir=" + dir.string(),
+                                      "--out.prefix=flow",
+                                      "--out.timestamp=false",
+                                      "--yes" };
+
+    std::vector<char *> argv;
+    for( std::string &a : args )
+    {
+        argv.push_back( a.data() );
+    }
+
+    xlinqCal::xlinqCal app;
+    REQUIRE( app.main( argv.size(), argv.data() ) == 0 );
+    REQUIRE( app.nDone() == nPoke );
+    REQUIRE( app.nWfs() == 2 );
+
+    mx::improc::eigenCube<float> flowEven;
+    REQUIRE( ff.read( flowEven, ( dir / ( "flow_" + cfg.flowName + "_even.fits" ) ).string() ) ==
+             mx::error_t::noerror );
+    REQUIRE( flowEven.planes() == nPoke );
+
+    for( int k = 0; k < nPoke; ++k )
+    {
+        Eigen::Map<const Eigen::VectorXf> shape( pokes.image( k ).data(), cfg.dmRows * cfg.dmCols );
+
+        Eigen::VectorXf oddExp = amp * ( sim.flowR().matrix() * shape );
+        Eigen::ArrayXf  evenExp =
+            amp * amp *
+            ( ( sim.flowHr().matrix() * shape ).array().square() + ( sim.flowHi().matrix() * shape ).array().square() );
+
+        Eigen::Map<const Eigen::VectorXf> oddGot( app.wfsProducts( 1 ).resp.image( k ).data(), oddExp.size() );
+        Eigen::Map<const Eigen::ArrayXf>  evenGot( flowEven.image( k ).data(), evenExp.size() );
+
+        double oddErr  = ( oddGot - oddExp ).norm() / oddExp.norm();
+        double evenErr = ( evenGot - evenExp ).matrix().norm() / evenExp.matrix().norm();
+
+        INFO( "poke " << k << " flow odd err " << oddErr << " even err " << evenErr );
+        REQUIRE( oddErr < 0.05 );
+        REQUIRE( evenErr < 0.1 );
+    }
+
+    for( const timingRecord &rec : app.timing() )
+    {
+        // About 100 camwfs and 150 camflowfs frames per camsci1 frame, inside the gate
+        double wfsPer  = rec[wfsColIndex( 0, wfsCol::n )] / nFrames;
+        double flowPer = rec[wfsColIndex( 1, wfsCol::n )] / nFrames;
+        INFO( "camwfs " << wfsPer << " camflowfs " << flowPer << " per camsci1 frame" );
+        REQUIRE( wfsPer > 80 );
+        REQUIRE( wfsPer < 120 );
+        REQUIRE( flowPer > 120 );
+        REQUIRE( flowPer < 180 );
+        // A workstation can stall the reader thread for a few 3 kHz frames; the reader resyncs to the newest frame
+        REQUIRE( rec[wfsColIndex( 1, wfsCol::missed )] < 0.05 * rec[wfsColIndex( 1, wfsCol::n )] );
+        REQUIRE( rec[wfsColIndex( 1, wfsCol::atimeFirst )] > rec[timingCol::tStart] - 0.01 );
+        REQUIRE( rec[wfsColIndex( 1, wfsCol::atimeLast )] <= rec[timingCol::tEnd] + 0.01 );
+    }
+
+    sim.stop();
+    std::filesystem::remove_all( dir );
+}
+
 /// A stop request (as from SIGINT) mid-run restores the DM channel, writes the completed planes,
 /// and returns 1.
 TEST_CASE( "xlinqCal stop request restores DM and saves completed planes", "[xlinqCal][integration]" )

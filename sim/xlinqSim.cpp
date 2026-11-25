@@ -35,6 +35,8 @@ class xlinqSimApp : public mx::app::application
 
     int m_nModes{ 0 }; ///< Number of simulated modal coefficients in `<prefix>modevalWFS`, 0 disables.
 
+    bool m_flowfs{ false }; ///< If true, simulate `<prefix>camflowfs`, a focal-plane camera at its own rate.
+
   public:
     /// Set up the configuration targets.
     virtual void setupConfig();
@@ -114,6 +116,16 @@ inline void xlinqSimApp::setupConfig()
                 false,
                 "float",
                 "camsci1 rms |H c| for 1 um rms; adds |H c|^2 [counts]. Default 0 (off)." );
+    config.add( "sim.flowfs",
+                "",
+                "sim.flowfs",
+                argType::Required,
+                "sim",
+                "flowfs",
+                false,
+                "bool",
+                "Simulate <prefix>camflowfs, a 3 kHz focal-plane camera with linear and quadratic responses. Default "
+                "false." );
     config.add( "sim.drift",
                 "",
                 "sim.drift",
@@ -143,6 +155,7 @@ inline void xlinqSimApp::loadConfig()
     config( m_cfg.wfsGain, "sim.wfsGain" );
     config( m_nModes, "sim.nModes" );
     config( m_cfg.sciQuadGain, "sim.sciQuadGain" );
+    config( m_flowfs, "sim.flowfs" );
     config( m_cfg.drift, "sim.drift" );
     config( m_nPokes, "sim.nPokes" );
 
@@ -155,6 +168,11 @@ inline void xlinqSimApp::loadConfig()
     {
         m_cfg.nModes      = m_nModes;
         m_cfg.modevalName = m_cfg.prefix + "modevalWFS";
+    }
+
+    if( m_flowfs )
+    {
+        m_cfg.flowName = m_cfg.prefix + "camflowfs";
     }
 }
 
@@ -181,6 +199,13 @@ inline int xlinqSimApp::execute()
             ff.write( m_cfg.prefix + "sciHr.fits", sim.sciHr() );
             ff.write( m_cfg.prefix + "sciHi.fits", sim.sciHi() );
         }
+        if( m_flowfs )
+        {
+            ff.write( m_cfg.prefix + "flowR.fits", sim.flowR() );
+            ff.write( m_cfg.prefix + "flowHr.fits", sim.flowHr() );
+            ff.write( m_cfg.prefix + "flowHi.fits", sim.flowHi() );
+        }
+
         ff.write( m_cfg.prefix + "pokes.fits",
                   xlinqCal::xlinqSim::randomPokes( m_cfg.dmRows, m_cfg.dmCols, m_nPokes, m_cfg.seed + 10 ) );
 
@@ -188,7 +213,7 @@ inline int xlinqSimApp::execute()
 
         std::cout << "simulating " << m_cfg.dmChannel << ", " << m_cfg.dmComb << ", " << m_cfg.wfsName << ", "
                   << m_cfg.sciName << ( m_nModes > 0 ? ", " + m_cfg.modevalName : std::string() )
-                  << "; ctrl-c to stop\n";
+                  << ( m_flowfs ? ", " + m_cfg.flowName : std::string() ) << "; ctrl-c to stop\n";
 
         while( !g_stop )
         {

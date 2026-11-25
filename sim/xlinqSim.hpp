@@ -157,6 +157,23 @@ struct xlinqSimConfig
 
     double sciNoise{ 2 }; ///< camsci1 per-frame noise rms [counts].
 
+    std::string flowName; ///< Optional focal-plane camera at its own rate (uint16), like camflowfs (the in-focus light
+                          ///< rejected by the knife edge): `level + R dm + |H dm|^2 + noise`. Empty disables.
+
+    uint32_t flowRows{ 8 }; ///< Focal-plane camera first dimension.
+
+    uint32_t flowCols{ 8 }; ///< Focal-plane camera second dimension.
+
+    double flowFps{ 3000 }; ///< Focal-plane camera frame rate.
+
+    double flowLevel{ 800 }; ///< Focal-plane camera mean level [counts].
+
+    double flowGain{ 30 }; ///< rms focal-plane camera linear response to a 1 micron rms poke [counts].
+
+    double flowQuadGain{ 30 }; ///< rms of |H c| for a 1 micron rms poke; the camera adds |H c|^2 [counts].
+
+    double flowNoise{ 2 }; ///< Focal-plane camera per-frame noise rms [counts].
+
     double drift{ 0.001 }; ///< Fractional level drift per second, both cameras.
 
     unsigned seed{ 1 }; ///< Random seed for the response matrices.
@@ -165,10 +182,11 @@ struct xlinqSimConfig
 /// Simulates dmcomb, camwfs, and camsci1 with known linear responses to the DM.
 /** Each camera frame is `level*(1 + drift*t) + R * dm + noise`, where `dm` is the combined DM
  * stream. camsci1 optionally adds `|H dm|^2` with H complex (`sciQuadGain`), a stand-in for the
- * speckle intensity |S|^2. camsci1 frames average the DM state over the exposure, so a poke during an exposure
- * partially contaminates that frame, as on the instrument. camsci1 frames are posted
- * `sciPostDelay` after the exposure ends, so a poke made just after a post lands partway into
- * the next exposure, as with readout and shmimTCP latency.
+ * speckle intensity |S|^2. An optional focal-plane camera (`flowName`, like camflowfs) runs at its own rate
+ * with linear and quadratic responses. camsci1 frames average the DM state over the exposure, so a poke during an
+ * exposure partially contaminates that frame, as on the instrument. camsci1 frames are posted `sciPostDelay` after the
+ * exposure ends, so a poke made just after a post lands partway into the next exposure, as with readout and shmimTCP
+ * latency.
  */
 class xlinqSim
 {
@@ -199,6 +217,14 @@ class xlinqSim
 
     mx::improc::eigenImage<float> m_sciHi; ///< Imaginary part of the camsci1 quadratic field response.
 
+    simStream m_flow; ///< The optional focal-plane camera stream, uint16.
+
+    mx::improc::eigenImage<float> m_flowR; ///< Focal-plane camera linear response, nFlowPix x nAct.
+
+    mx::improc::eigenImage<float> m_flowHr; ///< Real part of the focal-plane camera quadratic field response.
+
+    mx::improc::eigenImage<float> m_flowHi; ///< Imaginary part of the focal-plane camera quadratic field response.
+
     ///@}
 
     /** \name Simulation State - Data
@@ -213,6 +239,8 @@ class xlinqSim
 
     mx::improc::eigenImage<float> m_modevalSig; ///< Current modal coefficients of the combined DM, nModes x 1.
 
+    mx::improc::eigenImage<float> m_flowSig; ///< Current focal-plane camera response to the combined DM.
+
     std::atomic<bool> m_run{ false }; ///< True while the threads should run.
 
     std::thread m_combThread; ///< Combines the DM channel into the combined stream.
@@ -220,6 +248,8 @@ class xlinqSim
     std::thread m_wfsThread; ///< Produces camwfs frames.
 
     std::thread m_sciThread; ///< Produces camsci1 frames.
+
+    std::thread m_flowThread; ///< Produces focal-plane camera frames.
 
     std::chrono::steady_clock::time_point m_t0; ///< Start time, for drift.
 
@@ -255,6 +285,15 @@ class xlinqSim
     /// Get the imaginary part of the camsci1 quadratic field response, nSciPix x nAct.
     const mx::improc::eigenImage<float> &sciHi() const;
 
+    /// Get the focal-plane camera linear response, nFlowPix x nAct.
+    const mx::improc::eigenImage<float> &flowR() const;
+
+    /// Get the real part of the focal-plane camera quadratic field response, nFlowPix x nAct.
+    const mx::improc::eigenImage<float> &flowHr() const;
+
+    /// Get the imaginary part of the focal-plane camera quadratic field response, nFlowPix x nAct.
+    const mx::improc::eigenImage<float> &flowHi() const;
+
     /// Make a cube of random shapes, each normalized to 1 micron rms.
     static mx::improc::eigenCube<float> randomPokes( uint32_t rows, /**< [in] DM first dimension */
                                                      uint32_t cols, /**< [in] DM second dimension */
@@ -270,6 +309,9 @@ class xlinqSim
 
     /// The camsci1 thread.
     void sciThreadExec();
+
+    /// The focal-plane camera thread.
+    void flowThreadExec();
 
     /// Get seconds since start.
     double elapsed() const;
@@ -354,9 +396,12 @@ inline xlinqSim::xlinqSim( const xlinqSimConfig &cfg ) : m_cfg( cfg )
         checkPrefix( n );
     }
 
-    if( !cfg.modevalName.empty() )
+    for( const std::string &n : { cfg.modevalName, cfg.flowName } )
     {
-        checkPrefix( cfg.modevalName );
+        if( !n.empty() )
+        {
+            checkPrefix( n );
+        }
     }
 
     size_t nAct = cfg.dmRows * cfg.dmCols;
@@ -409,6 +454,33 @@ inline xlinqSim::xlinqSim( const xlinqSimConfig &cfg ) : m_cfg( cfg )
     m_sciSig.resize( m_sciR.rows(), 1 );
     m_wfsSig.setZero();
     m_sciSig.setZero();
+
+    // The focal-plane camera draws from its own generator, so enabling it leaves the other responses unchanged
+    std::mt19937 flowGen( cfg.seed + 10 );
+    float        flowScale = cfg.flowGain / sqrt( nAct );
+    float        flowQuad  = cfg.flowQuadGain / sqrt( 2.0 * nAct );
+
+    m_flowR.resize( cfg.flowRows * cfg.flowCols, nAct );
+    m_flowHr.resize( m_flowR.rows(), nAct );
+    m_flowHi.resize( m_flowR.rows(), nAct );
+
+    m_flowR = m_flowR.unaryExpr(
+        [&]( float )
+        {
+            return flowScale * norm( flowGen );
+        } );
+    m_flowHr = m_flowHr.unaryExpr(
+        [&]( float )
+        {
+            return flowQuad * norm( flowGen );
+        } );
+    m_flowHi = m_flowHi.unaryExpr(
+        [&]( float )
+        {
+            return flowQuad * norm( flowGen );
+        } );
+
+    m_flowSig.setZero( m_flowR.rows(), 1 );
 }
 
 inline xlinqSim::~xlinqSim()
@@ -428,19 +500,29 @@ inline void xlinqSim::start()
         m_modeval.create( m_cfg.modevalName, _DATATYPE_FLOAT, m_cfg.nModes, 1 );
     }
 
+    if( !m_cfg.flowName.empty() )
+    {
+        m_flow.create( m_cfg.flowName, _DATATYPE_UINT16, m_cfg.flowRows, m_cfg.flowCols );
+    }
+
     m_t0  = std::chrono::steady_clock::now();
     m_run = true;
 
     m_combThread = std::thread( &xlinqSim::combThreadExec, this );
     m_wfsThread  = std::thread( &xlinqSim::wfsThreadExec, this );
     m_sciThread  = std::thread( &xlinqSim::sciThreadExec, this );
+
+    if( !m_cfg.flowName.empty() )
+    {
+        m_flowThread = std::thread( &xlinqSim::flowThreadExec, this );
+    }
 }
 
 inline void xlinqSim::stop()
 {
     m_run = false;
 
-    for( std::thread *t : { &m_combThread, &m_wfsThread, &m_sciThread } )
+    for( std::thread *t : { &m_combThread, &m_wfsThread, &m_sciThread, &m_flowThread } )
     {
         if( t->joinable() )
         {
@@ -453,6 +535,7 @@ inline void xlinqSim::stop()
     m_wfs.destroy();
     m_sci.destroy();
     m_modeval.destroy();
+    m_flow.destroy();
 }
 
 inline const mx::improc::eigenImage<float> &xlinqSim::wfsR() const
@@ -478,6 +561,21 @@ inline const mx::improc::eigenImage<float> &xlinqSim::sciHr() const
 inline const mx::improc::eigenImage<float> &xlinqSim::sciHi() const
 {
     return m_sciHi;
+}
+
+inline const mx::improc::eigenImage<float> &xlinqSim::flowR() const
+{
+    return m_flowR;
+}
+
+inline const mx::improc::eigenImage<float> &xlinqSim::flowHr() const
+{
+    return m_flowHr;
+}
+
+inline const mx::improc::eigenImage<float> &xlinqSim::flowHi() const
+{
+    return m_flowHi;
 }
 
 inline mx::improc::eigenCube<float> xlinqSim::randomPokes( uint32_t rows, uint32_t cols, int n, unsigned seed )
@@ -541,6 +639,12 @@ inline void xlinqSim::combThreadExec()
             if( m_cfg.sciQuadGain > 0 )
             {
                 m_sciSig += ( m_sciHr.matrix() * cmd ).array().square() + ( m_sciHi.matrix() * cmd ).array().square();
+            }
+
+            if( !m_cfg.flowName.empty() )
+            {
+                m_flowSig = ( m_flowR.matrix() * cmd ).array() + ( m_flowHr.matrix() * cmd ).array().square() +
+                            ( m_flowHi.matrix() * cmd ).array().square();
             }
         }
 
@@ -606,6 +710,42 @@ inline void xlinqSim::wfsThreadExec()
                 } );
             m_modeval.post( wfsAtime ); // cacao carries the camera atime through
         }
+    }
+}
+
+inline void xlinqSim::flowThreadExec()
+{
+    std::mt19937                    gen( m_cfg.seed + 3 );
+    std::normal_distribution<float> norm( 0, m_cfg.flowNoise );
+
+    size_t                        nPix = m_cfg.flowRows * m_cfg.flowCols;
+    mx::improc::eigenImage<float> frame( nPix, 1 );
+
+    auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>( 1.0 / m_cfg.flowFps ) );
+    auto next = std::chrono::steady_clock::now();
+
+    while( m_run )
+    {
+        next += period;
+        std::this_thread::sleep_until( next );
+
+        float level = m_cfg.flowLevel * ( 1 + m_cfg.drift * elapsed() );
+
+        { //mutex scope
+            std::lock_guard<std::mutex> lock( m_sigMutex );
+            frame = level + m_flowSig;
+        }
+
+        m_flow.setWrite();
+        uint16_t *p = m_flow.data<uint16_t>();
+
+        for( size_t i = 0; i < nPix; ++i )
+        {
+            p[i] = static_cast<uint16_t>( std::clamp( std::lround( frame( i ) + norm( gen ) ), 0L, 65535L ) );
+        }
+
+        m_flow.post( realtimeNow() );
     }
 }
 
