@@ -171,6 +171,12 @@ class xlinqCal : public mx::app::application
 
     double m_darkWait{ 15 }; ///< Timeout [s] for the shutter to reach the requested state.
 
+    std::vector<std::string> m_darkWfs; ///< WFS streams whose camera shutters are shut with camsci1's for the dark.
+
+    std::vector<std::string> m_darkWfsDevice; ///< INDI devices of the dark.wfs cameras, default the stream names.
+
+    std::vector<size_t> m_darkWfsIdx; ///< Indices in m_wfs of the dark.wfs streams.
+
     unsigned m_psfN{ 0 }; ///< camsci1 frames averaged per unsaturated PSF block (start and end), 0 for none.
 
     std::string m_psfWheel{ "fwscind" }; ///< The INDI device of the filter wheel switched for the PSF.
@@ -230,7 +236,7 @@ class xlinqCal : public mx::app::application
 
     double m_sciEmgain{ std::numeric_limits<double>::quiet_NaN() }; ///< camsci1 EM gain from INDI.
 
-    bool m_shutterShut{ false }; ///< True if xlinqCal shut the camsci1 shutter and has not confirmed it open again.
+    bool m_shutterShut{ false }; ///< True if xlinqCal shut the dark shutters and has not confirmed them open again.
 
     unsigned m_darkTaken{ 0 }; ///< Frames in the saved dark, 0 if none.
 
@@ -540,15 +546,19 @@ class xlinqCal : public mx::app::application
     int indiRecord( const std::string                  &suffix, /**< [in] appended to the output prefix */
                     std::map<std::string, std::string> &vals /**< [out] `device.property.element` to value */ );
 
-    /// Command the camsci1 shutter and wait for the readback.
-    /** `shutter.toggle` On is shut and Off is open (MagAOX stdCamera); the readback is polled every
-     * indi.poll seconds until it matches or dark.wait passes.
-     * \returns 0 when the readback matches, -1 on error or timeout
+    /// The cameras whose shutters are shut for the dark: sci.device, then dark.wfsDevice.
+    std::vector<std::string> darkDevices() const;
+
+    /// Command the dark cameras' shutters together and wait for all readbacks.
+    /** `shutter.toggle` On is shut and Off is open (MagAOX stdCamera); the readbacks are polled every
+     * indi.poll seconds until all match or dark.wait passes.
+     * \returns 0 when all readbacks match, -1 on error or timeout
      */
     int setShutter( bool shut /**< [in] true to shut */ );
 
     /// Take the dark after the run: shut, discard, average dark.n frames, open, and save `_<sci>_dark.fits`.
-    /** The shutter is always commanded open again once shut, even on error or stop.
+    /** The dark.wfs streams are averaged over the same frames, with their own shutters shut, into
+     * `_<stream>_dark.fits`. The shutters are always commanded open again once shut, even on error or stop.
      * \returns 0 on success, 1 if stopped, -1 on error
      */
     int takeDark();
@@ -1018,6 +1028,25 @@ inline void xlinqCal::setupConfig()
                 false,
                 "float",
                 "Timeout for the shutter to reach the requested state [s]. Default 15." );
+    config.add( "dark.wfs",
+                "",
+                "dark.wfs",
+                argType::Required,
+                "dark",
+                "wfs",
+                false,
+                "vector<string>",
+                "WFS streams (in wfs.shmim) whose camera shutters are shut with the sci shutter for the dark, each "
+                "averaged over the dark frames into _<stream>_dark.fits, e.g. camflowfs. Needs dark.n. Default none." );
+    config.add( "dark.wfsDevice",
+                "",
+                "dark.wfsDevice",
+                argType::Required,
+                "dark",
+                "wfsDevice",
+                false,
+                "vector<string>",
+                "INDI devices of the dark.wfs cameras, in the same order. Default the stream names." );
 
     config.add( "psf.n",
                 "",
@@ -1227,6 +1256,8 @@ inline void xlinqCal::loadConfig()
     config( m_darkN, "dark.n" );
     config( m_darkDiscard, "dark.discard" );
     config( m_darkWait, "dark.wait" );
+    config( m_darkWfs, "dark.wfs" );
+    config( m_darkWfsDevice, "dark.wfsDevice" );
     config( m_psfN, "psf.n" );
     config( m_psfWheel, "psf.wheel" );
     config( m_psfFilter, "psf.filter" );
@@ -1282,6 +1313,36 @@ inline int xlinqCal::execute()
     {
         logError( "dark.n > 0 needs indi.enable=true" );
         return -1;
+    }
+
+    if( !m_darkWfs.empty() && m_darkN == 0 )
+    {
+        logError( "dark.wfs needs dark.n > 0" );
+        return -1;
+    }
+
+    if( m_darkWfsDevice.empty() )
+    {
+        m_darkWfsDevice = m_darkWfs;
+    }
+    else if( m_darkWfsDevice.size() != m_darkWfs.size() )
+    {
+        logError( "dark.wfsDevice must list one device per dark.wfs stream" );
+        return -1;
+    }
+
+    m_darkWfsIdx.clear();
+    for( const std::string &name : m_darkWfs )
+    {
+        auto it = std::find( m_wfsNames.begin(), m_wfsNames.end(), name );
+
+        if( it == m_wfsNames.end() )
+        {
+            logError( "dark.wfs stream " + name + " is not in wfs.shmim" );
+            return -1;
+        }
+
+        m_darkWfsIdx.push_back( it - m_wfsNames.begin() );
     }
 
     if( m_psfN > 0 && !m_indiEnable )
@@ -1703,8 +1764,13 @@ inline int xlinqCal::preflight()
     if( m_indiEnable )
     {
         os << "  indi:    record " << indiPropList().size() << " properties at start and end; ";
-        os << ( m_darkN > 0 ? "dark of " + std::to_string( m_darkN ) + " frames after the run (" + m_sciDevice +
-                                  " shutter shut, then opened)"
+        std::string shutters;
+        for( const std::string &d : darkDevices() )
+        {
+            shutters += ( shutters.empty() ? "" : ", " ) + d;
+        }
+        os << ( m_darkN > 0 ? "dark of " + std::to_string( m_darkN ) + " frames after the run (" + shutters +
+                                  ( m_darkWfs.empty() ? " shutter" : " shutters" ) + " shut, then opened)"
                             : std::string( "no dark" ) )
            << "\n";
     }
@@ -2450,6 +2516,17 @@ inline std::vector<std::string> xlinqCal::indiPropList() const
         props.push_back( m_psfWheel + ".filterName" );
     }
 
+    for( const std::string &d : m_darkWfsDevice )
+    {
+        for( const char *p : { ".fsm", ".exptime", ".fps", ".shutter_status", ".shutter" } )
+        {
+            if( std::find( props.begin(), props.end(), d + p ) == props.end() )
+            {
+                props.push_back( d + p );
+            }
+        }
+    }
+
     for( const std::string &p : m_indiProps )
     {
         if( std::find( props.begin(), props.end(), p ) == props.end() )
@@ -2566,28 +2643,37 @@ inline int xlinqCal::indiPreflight()
         return 0;
     }
 
-    if( m_indi.getElement( m_sciDevice + ".shutter_status.status", val, err ) < 0 )
+    for( const std::string &dev : darkDevices() )
     {
-        logError( "INDI shutter check failed: " + err );
-        return -1;
-    }
+        if( !indiClient::validName( dev + ".shutter.toggle", 2 ) )
+        {
+            logError( "invalid shutter device '" + dev + "'" );
+            return -1;
+        }
 
-    if( val != "READY" )
-    {
-        logError( m_sciDevice + " shutter status is " + val + ", not READY: can't take a dark" );
-        return -1;
-    }
+        if( m_indi.getElement( dev + ".shutter_status.status", val, err ) < 0 )
+        {
+            logError( "INDI shutter check failed: " + err );
+            return -1;
+        }
 
-    if( m_indi.getElement( m_sciDevice + ".shutter.toggle", val, err ) < 0 )
-    {
-        logError( "INDI shutter check failed: " + err );
-        return -1;
-    }
+        if( val != "READY" )
+        {
+            logError( dev + " shutter status is " + val + ", not READY: can't take a dark" );
+            return -1;
+        }
 
-    if( val != "Off" )
-    {
-        logError( m_sciDevice + " shutter is shut (shutter.toggle=" + val + "): open it before calibrating" );
-        return -1;
+        if( m_indi.getElement( dev + ".shutter.toggle", val, err ) < 0 )
+        {
+            logError( "INDI shutter check failed: " + err );
+            return -1;
+        }
+
+        if( val != "Off" )
+        {
+            logError( dev + " shutter is shut (shutter.toggle=" + val + "): open it before calibrating" );
+            return -1;
+        }
     }
 
     return 0;
@@ -2651,34 +2737,68 @@ inline int xlinqCal::indiRecord( const std::string &suffix, std::map<std::string
     return 0;
 }
 
+inline std::vector<std::string> xlinqCal::darkDevices() const
+{
+    std::vector<std::string> devs = { m_sciDevice };
+    devs.insert( devs.end(), m_darkWfsDevice.begin(), m_darkWfsDevice.end() );
+    return devs;
+}
+
 inline int xlinqCal::setShutter( bool shut )
 {
-    std::string elem = m_sciDevice + ".shutter.toggle";
-    std::string want = shut ? "On" : "Off";
-    std::string val, err;
+    std::vector<std::string> devs = darkDevices();
+    std::string              want = shut ? "On" : "Off";
+    std::string              val, err;
+    int                      rv = 0;
 
-    if( m_indi.setSwitch( elem, shut, err ) < 0 )
+    // Command every shutter, even if one command fails, so that opening never leaves one shut
+    for( const std::string &dev : devs )
     {
-        logError( "shutter command failed: " + err );
-        return -1;
+        if( m_indi.setSwitch( dev + ".shutter.toggle", shut, err ) < 0 )
+        {
+            logError( dev + " shutter command failed: " + err );
+            rv = -1;
+        }
     }
 
-    double tEnd = nowSec() + m_darkWait;
+    if( rv != 0 )
+    {
+        return rv;
+    }
+
+    std::vector<bool> done( devs.size(), false );
+    size_t            nDone = 0;
+    double            tEnd  = nowSec() + m_darkWait;
 
     while( true )
     {
         std::this_thread::sleep_for( std::chrono::duration<double>( m_indiPoll ) );
 
-        if( m_indi.getElement( elem, val, err ) == 0 && val == want )
+        for( size_t i = 0; i < devs.size(); ++i )
         {
-            log( m_sciDevice + " shutter " + ( shut ? "shut" : "open" ) );
+            if( !done[i] && m_indi.getElement( devs[i] + ".shutter.toggle", val, err ) == 0 && val == want )
+            {
+                done[i] = true;
+                ++nDone;
+                log( devs[i] + " shutter " + ( shut ? "shut" : "open" ) );
+            }
+        }
+
+        if( nDone == devs.size() )
+        {
             return 0;
         }
 
         if( nowSec() > tEnd )
         {
-            logError( m_sciDevice + " shutter did not " + ( shut ? "shut" : "open" ) + " within dark.wait (" + elem +
-                      "=" + ( err.empty() ? val : err ) + ")" );
+            for( size_t i = 0; i < devs.size(); ++i )
+            {
+                if( !done[i] )
+                {
+                    logError( devs[i] + " shutter did not " + ( shut ? "shut" : "open" ) + " within dark.wait" );
+                }
+            }
+
             return -1;
         }
     }
@@ -2686,11 +2806,17 @@ inline int xlinqCal::setShutter( bool shut )
 
 inline int xlinqCal::takeDark()
 {
-    log( "taking dark: " + std::to_string( m_darkN ) + " frames" );
+    std::string shutters;
+    for( const std::string &d : darkDevices() )
+    {
+        shutters += ( shutters.empty() ? "" : " " ) + d;
+    }
+
+    log( "taking dark: " + std::to_string( m_darkN ) + " frames, shutting " + shutters );
 
     if( setShutter( true ) < 0 )
     {
-        // It may have shut late: always command it open again
+        // One may have shut late: always command them open again
         m_shutterShut = true;
 
         if( setShutter( false ) == 0 )
@@ -2699,7 +2825,7 @@ inline int xlinqCal::takeDark()
         }
         else
         {
-            logError( "THE " + m_sciDevice + " SHUTTER MAY BE SHUT: check and open it" );
+            logError( "SHUTTERS MAY BE SHUT (" + shutters + "): check and open them" );
         }
 
         return -1;
@@ -2725,6 +2851,13 @@ inline int xlinqCal::takeDark()
         rv = waitSciFrame( nullptr, cnt0 );
     }
 
+    // The dark.wfs streams are averaged over the same window as the sci dark frames
+    for( size_t i : m_darkWfsIdx )
+    {
+        m_wfs[i]->start();
+        m_wfs[i]->openGate();
+    }
+
     for( unsigned n = 0; n < m_darkN && rv == 0; ++n )
     {
         if( ( rv = waitSciFrame( &frame, cnt0 ) ) == 0 )
@@ -2733,23 +2866,42 @@ inline int xlinqCal::takeDark()
         }
     }
 
+    std::vector<mx::improc::eigenImage<double>> wfsDark( m_darkWfsIdx.size() );
+    std::vector<wfsGateStats>                   wfsStats( m_darkWfsIdx.size() );
+    std::vector<bool>                           wfsOk( m_darkWfsIdx.size(), false );
+
+    for( size_t k = 0; k < m_darkWfsIdx.size(); ++k )
+    {
+        wfsOk[k] = m_wfs[m_darkWfsIdx[k]]->closeGate( wfsDark[k], wfsStats[k] );
+        m_wfs[m_darkWfsIdx[k]]->stop();
+    }
+
     clock_gettime( CLOCK_REALTIME, &ts );
     std::string darkEnd = isoTime( ts );
 
-    // Always open the shutter again, even if stopped or on error
+    // Always open the shutters again, even if stopped or on error
     if( setShutter( false ) == 0 )
     {
         m_shutterShut = false;
     }
     else
     {
-        logError( "THE " + m_sciDevice + " SHUTTER MAY STILL BE SHUT: check and open it" );
+        logError( "SHUTTERS MAY STILL BE SHUT (" + shutters + "): check and open them" );
         rv = -1;
     }
 
     if( rv != 0 )
     {
         return rv;
+    }
+
+    for( size_t k = 0; k < m_darkWfsIdx.size(); ++k )
+    {
+        if( !wfsOk[k] )
+        {
+            logError( "no " + m_darkWfs[k] + " frames received during the dark" );
+            return -1;
+        }
     }
 
     mx::improc::eigenImage<float> dark = ( sum / static_cast<double>( m_darkN ) ).cast<float>();
@@ -2779,6 +2931,44 @@ inline int xlinqCal::takeDark()
     }
 
     log( "wrote dark to " + file );
+
+    for( size_t k = 0; k < m_darkWfsIdx.size(); ++k )
+    {
+        const camProducts            &prod = m_wfs[m_darkWfsIdx[k]]->products();
+        mx::improc::eigenImage<float> wd   = wfsDark[k].cast<float>();
+
+        if( prod.ref.planes() > 0 )
+        {
+            double litMean = prod.ref.image( 0 ).mean();
+            log( m_darkWfs[k] + " dark mean " + std::to_string( wd.mean() ) + ", first reference mean " +
+                 std::to_string( litMean ) );
+
+            if( wd.mean() > 0.9 * litMean )
+            {
+                log( "warning: " + m_darkWfs[k] + " dark is not below its reference: did its shutter close?" );
+            }
+        }
+
+        mx::fits::fitsHeader<> wh = outputHeader( true );
+        wh.append( "PRODUCT",
+                   std::string( "dark: mean of the WFS frames during the sci dark, shutter shut" ),
+                   "content of this cube" );
+        wh.append( "DARKDEV", m_darkWfsDevice[k], "INDI device whose shutter was shut" );
+        wh.append( "DARKBEG", darkBeg, "UTC shutters confirmed shut" );
+        wh.append( "DARKEND", darkEnd, "UTC last dark frame" );
+        wh.append( "DARKNFR", static_cast<long>( wfsStats[k].n ), "WFS frames averaged" );
+        wh.append( "DARKMISS", static_cast<long>( wfsStats[k].missed ), "WFS frames missed (cnt0 gaps)" );
+
+        std::string wfile = outputPath( "_" + m_darkWfs[k] + "_dark.fits" );
+
+        if( ff.write( wfile, wd, wh ) != mx::error_t::noerror )
+        {
+            logError( "could not write " + wfile );
+            return -1;
+        }
+
+        log( "wrote " + std::to_string( wfsStats[k].n ) + "-frame " + m_darkWfs[k] + " dark to " + wfile );
+    }
 
     return 0;
 }

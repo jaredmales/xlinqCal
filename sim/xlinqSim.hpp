@@ -174,6 +174,11 @@ struct xlinqSimConfig
 
     double flowNoise{ 2 }; ///< Focal-plane camera per-frame noise rms [counts].
 
+    double flowDark{ 100 }; ///< Focal-plane camera level with its shutter shut [counts].
+
+    std::string flowShutterFile; ///< If set, the focal-plane camera's shutter state file (as shutterFile), read every
+                                 ///< 10 ms.
+
     double drift{ 0.001 }; ///< Fractional level drift per second, both cameras.
 
     unsigned seed{ 1 }; ///< Random seed for the response matrices.
@@ -318,6 +323,9 @@ class xlinqSim
 
     /// True if the shutter file says the shutter is shut.
     bool shutterShut() const;
+
+    /// True if a state file's content starts with "On"; false if the name is empty or the file can't be read.
+    static bool fileSaysOn( const std::string &file /**< [in] the state file */ );
 
     /// The light transmission set by attenFile: attenFactor if it says On, else 1.
     double transmission() const;
@@ -725,16 +733,33 @@ inline void xlinqSim::flowThreadExec()
         std::chrono::duration<double>( 1.0 / m_cfg.flowFps ) );
     auto next = std::chrono::steady_clock::now();
 
+    // The shutter state file is read every 10 ms, not every frame
+    uint64_t nCheck = std::max<uint64_t>( 1, static_cast<uint64_t>( m_cfg.flowFps / 100 ) );
+    uint64_t nFrame = 0;
+    bool     shut   = false;
+
     while( m_run )
     {
         next += period;
         std::this_thread::sleep_until( next );
 
-        float level = m_cfg.flowLevel * ( 1 + m_cfg.drift * elapsed() );
+        if( nFrame++ % nCheck == 0 )
+        {
+            shut = fileSaysOn( m_cfg.flowShutterFile );
+        }
 
-        { //mutex scope
-            std::lock_guard<std::mutex> lock( m_sigMutex );
-            frame = level + m_flowSig;
+        if( shut )
+        {
+            frame.setConstant( m_cfg.flowDark );
+        }
+        else
+        {
+            float level = m_cfg.flowLevel * ( 1 + m_cfg.drift * elapsed() );
+
+            { //mutex scope
+                std::lock_guard<std::mutex> lock( m_sigMutex );
+                frame = level + m_flowSig;
+            }
         }
 
         m_flow.setWrite();
@@ -867,12 +892,17 @@ inline void xlinqSim::sciThreadExec()
 
 inline bool xlinqSim::shutterShut() const
 {
-    if( m_cfg.shutterFile.empty() )
+    return fileSaysOn( m_cfg.shutterFile );
+}
+
+inline bool xlinqSim::fileSaysOn( const std::string &file )
+{
+    if( file.empty() )
     {
         return false;
     }
 
-    std::ifstream fin( m_cfg.shutterFile );
+    std::ifstream fin( file );
     std::string   state;
     fin >> state;
 

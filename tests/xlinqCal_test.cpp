@@ -921,6 +921,161 @@ TEST_CASE( "xlinqCal records INDI state and takes a dark", "[xlinqCal][integrati
     std::filesystem::remove_all( dir );
 }
 
+/// dark.wfs shuts a WFS camera's shutter (camflowfs) with the sci shutter, averages that stream over the sci dark
+/// frames into its own dark, records the camera's INDI state, and opens both shutters again. It refuses to start if
+/// that shutter is not ready, or if the stream is not a WFS stream.
+TEST_CASE( "xlinqCal takes a WFS camera dark with the sci dark", "[xlinqCal][integration][indi]" )
+{
+    using namespace xlinqCal;
+
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / ( xlinqCalTest::testPrefix() + "wfsdark_out" );
+    std::filesystem::create_directories( dir );
+    xlinqCalTest::fakeIndi indi( dir / "indi" );
+
+    const std::string dev  = "xlsimcam";
+    const std::string fdev = "xlsimflow";
+    for( const std::string &d : { dev, fdev } )
+    {
+        indi.set( d + ".fsm.state", "READY" );
+        indi.set( d + ".exptime.current", "0.05" );
+        indi.set( d + ".fps.current", "20" );
+        indi.set( d + ".shutter_status.status", "READY" );
+        indi.set( d + ".shutter.toggle", "Off" );
+    }
+    indi.set( dev + ".emgain.current", "1" );
+
+    xlinqSimConfig cfg;
+    cfg.prefix          = xlinqCalTest::testPrefix() + "wfsdark_";
+    cfg.dmChannel       = cfg.prefix + "dm01disp04";
+    cfg.dmComb          = cfg.prefix + "dm01disp";
+    cfg.wfsName         = cfg.prefix + "camwfs";
+    cfg.sciName         = cfg.prefix + "camsci1";
+    cfg.flowName        = cfg.prefix + "camflowfs";
+    cfg.wfsFps          = 1000;
+    cfg.flowFps         = 3000;
+    cfg.sciFps          = 20;
+    cfg.sciPostDelay    = 0.015;
+    cfg.shutterFile     = ( indi.state / ( dev + ".shutter.toggle" ) ).string();
+    cfg.flowShutterFile = ( indi.state / ( fdev + ".shutter.toggle" ) ).string();
+
+    mx::improc::eigenCube<float> pokes    = xlinqSim::randomPokes( cfg.dmRows, cfg.dmCols, 2, 5 );
+    std::string                  pokeFile = ( dir / "pokes.fits" ).string();
+    mx::fits::fitsFile<float>    ff;
+    REQUIRE( ff.write( pokeFile, pokes ) == mx::error_t::noerror );
+
+    xlinqSim sim( cfg );
+    sim.start();
+
+    auto runApp = [&]( const std::string &prefix, std::vector<std::string> extra )
+    {
+        std::vector<std::string> args = { "xlinqCal",
+                                          "--dm.channel=" + cfg.dmChannel,
+                                          "--dm.comb=" + cfg.dmComb,
+                                          "--sci.shmim=" + cfg.sciName,
+                                          "--wfs.shmim=" + cfg.wfsName + "," + cfg.flowName,
+                                          "--poke.file=" + pokeFile,
+                                          "--poke.amp=0.1",
+                                          "--sci.nFrames=2",
+                                          "--preflight.time=0.3",
+                                          "--out.dir=" + dir.string(),
+                                          "--out.prefix=" + prefix,
+                                          "--out.timestamp=false",
+                                          "--indi.enable=true",
+                                          "--indi.get=" + indi.getCmd,
+                                          "--indi.set=" + indi.setCmd,
+                                          "--indi.poll=0.2",
+                                          "--sci.device=" + dev,
+                                          "--yes" };
+        args.insert( args.end(), extra.begin(), extra.end() );
+
+        std::vector<char *> argv;
+        for( std::string &a : args )
+        {
+            argv.push_back( a.data() );
+        }
+
+        xlinqCal::xlinqCal app;
+        int                rv = app.main( argv.size(), argv.data() );
+        return std::make_pair( rv, app.nDone() );
+    };
+
+    SECTION( "both shutters shut for the dark, then opened" )
+    {
+        auto [rv, nDone] = runApp( "wd", { "--dark.n=3", "--dark.wfs=" + cfg.flowName, "--dark.wfsDevice=" + fdev } );
+        REQUIRE( rv == 0 );
+        REQUIRE( nDone == 2 );
+
+        // The camflowfs dark is its shut level, averaged over the 3 sci dark frames (~150 frames each)
+        mx::improc::eigenImage<float> dark;
+        mx::fits::fitsHeader<>        dhead;
+        REQUIRE( ff.read( dark, dhead, ( dir / ( "wd_" + cfg.flowName + "_dark.fits" ) ).string() ) ==
+                 mx::error_t::noerror );
+        REQUIRE( dark.rows() == static_cast<int>( cfg.flowRows ) );
+        REQUIRE( dark.mean() == Approx( cfg.flowDark ).margin( 1 ) );
+        REQUIRE( dhead["DARKDEV"].value<std::string>() == fdev );
+        REQUIRE( dhead["DARKNFR"].value<long>() > 300 );
+        REQUIRE( dhead["DARKNFR"].value<long>() < 600 );
+
+        REQUIRE( ff.read( dark, ( dir / ( "wd_" + cfg.sciName + "_dark.fits" ) ).string() ) == mx::error_t::noerror );
+        REQUIRE( dark.mean() == Approx( cfg.sciDark ).margin( 2 ) );
+
+        // Both commanded shut, then both open, with typed sets
+        REQUIRE( indi.get( dev + ".shutter.toggle" ) == "Off" );
+        REQUIRE( indi.get( fdev + ".shutter.toggle" ) == "Off" );
+        std::vector<std::string> sets = indi.lines( "setlog" );
+        REQUIRE( sets.size() == 4 );
+        REQUIRE( sets[0] == "-s " + dev + ".shutter.toggle=On" );
+        REQUIRE( sets[1] == "-s " + fdev + ".shutter.toggle=On" );
+        REQUIRE( sets[2] == "-s " + dev + ".shutter.toggle=Off" );
+        REQUIRE( sets[3] == "-s " + fdev + ".shutter.toggle=Off" );
+
+        // The WFS camera's state is recorded
+        std::ifstream     fin( dir / "wd_indi.txt" );
+        std::stringstream ss;
+        ss << fin.rdbuf();
+        REQUIRE( ss.str().find( fdev + ".exptime.current=0.05" ) != std::string::npos );
+        REQUIRE( ss.str().find( fdev + ".shutter.toggle=Off" ) != std::string::npos );
+
+        // The flowfs responses were measured with its shutter open
+        mx::improc::eigenCube<float> ref;
+        REQUIRE( ff.read( ref, ( dir / ( "wd_" + cfg.flowName + "_ref.fits" ) ).string() ) == mx::error_t::noerror );
+        REQUIRE( ref.image( 0 ).mean() > 0.9 * cfg.flowLevel );
+
+        for( const std::string &g : indi.lines( "getlog" ) )
+        {
+            INFO( g );
+            REQUIRE( indiClient::validName( g, 1 ) );
+        }
+    }
+
+    SECTION( "refuses when the WFS camera shutter is not ready" )
+    {
+        indi.set( fdev + ".shutter_status.status", "POWEROFF" );
+        auto [rv, nDone] = runApp( "nr", { "--dark.n=3", "--dark.wfs=" + cfg.flowName, "--dark.wfsDevice=" + fdev } );
+        REQUIRE( rv == -1 );
+        REQUIRE( nDone == 0 );
+        REQUIRE( indi.lines( "setlog" ).empty() );
+    }
+
+    SECTION( "refuses a dark.wfs stream that is not in wfs.shmim" )
+    {
+        auto [rv, nDone] = runApp( "nw", { "--dark.n=3", "--dark.wfs=" + cfg.prefix + "other" } );
+        REQUIRE( rv == -1 );
+        REQUIRE( nDone == 0 );
+        REQUIRE( indi.lines( "setlog" ).empty() );
+    }
+
+    SECTION( "dark.wfs needs dark.n" )
+    {
+        auto [rv, nDone] = runApp( "nn", { "--dark.wfs=" + cfg.flowName } );
+        REQUIRE( rv == -1 );
+        REQUIRE( nDone == 0 );
+    }
+
+    sim.stop();
+    std::filesystem::remove_all( dir );
+}
+
 /// With a saturated core, xlinqCal takes unsaturated PSFs with the ND wheel at the start and end, with +/- calibration
 /// speckles at both filters whose ratio is the transmission, puts the wheel back each time, and excludes the core
 /// from the linearity check. The PSF centers the core mask, which the bleed stripe pulls off center. Already at the

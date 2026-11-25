@@ -55,6 +55,7 @@ In `out.dir`, with prefix `<out.prefix>_<UTC timestamp>` (e.g. `xlinqCal_2026112
 | `<prefix>_snap_<name>_end.fits` | written only if that stream changed during the run (a warning is logged) |
 | `<prefix>_indi.txt`, `<prefix>_indi_end.txt` | with `indi.enable`: INDI state at the start and end, one `device.property.element=value` line per element (getINDI's format); unreadable properties are noted with `#` |
 | `<prefix>_camsci1_dark.fits` | with `dark.n` > 0: mean of `dark.n` camsci1 frames taken with the shutter shut after a complete run |
+| `<prefix>_<wfs>_dark.fits` | for each `dark.wfs` stream (e.g. camflowfs): its frames averaged over the same dark window, with its own camera shutter shut too (`DARKNFR` frames) |
 | `<prefix>_camsci1_psf.fits`, `<prefix>_camsci1_psf_end.fits` | with `psf.n` > 0: PSF block before the first poke and after a complete run, a cube of `psf.n`-frame means (plane 0: `psf.filter`, DM at its initial state; with calibration speckles, also ± speckles at both filters; see `PLANEn`) |
 | `<prefix>.log` | run log |
 
@@ -71,8 +72,10 @@ xlinqCal is a minimal INDI client. It shells out to MagAO-X's `getINDI` and `set
   3. opens the shutter again and confirms it.
 
   Once shut, the shutter is always commanded open again, also after a stop or error; if that can't be confirmed, the log says so loudly. A stopped or failed run takes no dark.
+
+  `dark.wfs=camflowfs` adds WFS cameras: their shutters (INDI device `dark.wfsDevice`, default the stream name) get the same preflight checks, are shut and opened together with the sci shutter, and their stream is averaged over the sci dark frames into `_<stream>_dark.fits`. Their `fsm`, `exptime`, `fps`, and shutter properties are recorded too. Don't list a camera the AO loop runs on.
 - **MagAOX rules for INDI clients:** every get is one exact `device.property` (no wildcards, no device-wide or all-property requests). Every set is type-flagged. Each call has a wall-clock limit (`indi.timeout`), and readbacks are polled every `indi.poll` s (default 2, the MagAOX minimum).
-- **Reachability on RTC:** `camsci1` is visible through RTC's indiserver. `fwsci1`, `stagesci1`, and `camsci1-dark` need to be added to RTC's indiserver remotes before they can go in `indi.props`.
+- **Reachability on RTC:** `camsci1` is visible through RTC's indiserver; `camflowfs` must be too, for `dark.wfs`. `fwsci1`, `stagesci1`, and `camsci1-dark` need to be added to RTC's indiserver remotes before they can go in `indi.props`.
 
 ## Saturated core with unsaturated PSFs
 
