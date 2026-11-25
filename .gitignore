@@ -8,3 +8,4 @@ xlsim_*.fits
 try*/
 __pycache__/
 CMmodesDM.fits
+sky*/

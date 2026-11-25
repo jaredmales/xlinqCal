@@ -109,6 +109,14 @@ python3 tools/quadrature_field.py --modes modFourier_48.fits --data try2/xlinqCa
     --out try2/field.fits --png try2/field.png
 ```
 
+`tools/telem_screens.py` makes a poke cube from the AO residual of an observation, so the coronagraph's response to the observed wavefronts can be calibrated on the internal source afterwards (`example/runSky.conf`). It maps the full-rate telemetry to Fourier coefficients using a Fourier-mode run taken with the same WFS and reconstructor (`--cal`). The input is either the loop's modal coefficients (`--input modeval`, for any reconstructor including a nonlinear one) or raw camwfs frames (`--input camwfs`, linear reconstruction, modulated pyramid only). It reads the streamWriter `.xrif` archives directly (`tools/xrif_read.py`, libxrif through ctypes), searching directories recursively and selecting the observation by atime with `--start`/`--end`, so no decoding to FITS is needed. The lag-1 covariance, over frames with consecutive cnt0, gives the signal covariance with the WFS noise removed. The cube holds the leading PCA modes of that covariance at 1σ, then random screens drawn from it at several scales, then repeats. Every plane's Fourier coefficients are in the `COEFFS` extension.
+
+```
+python3 tools/telem_screens.py --input modeval /data/rawimages/aol1_modevalWFS \
+    --start 2026-11-25T03:10:00 --end 2026-11-25T03:40:00 \
+    --modes modFourier_48.fits --cal try10/try10_<time> --out sky_screens.fits
+```
+
 ## Building and testing
 
 Requires mxlib (built with MILK support), ImageStreamIO, and cfitsio, found via `pkg-config mxlib`.
